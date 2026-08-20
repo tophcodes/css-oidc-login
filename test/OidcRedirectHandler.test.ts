@@ -88,15 +88,18 @@ test('hands the browser a handle that is not the state and not in the authorizat
   const pending = await store.consume(state);
   assert.ok(pending);
 
-  const value = /^css-oidc-login-pending=([^;]+)/u.exec(cookie as string)?.[1];
+  const value = /^__Host-css-oidc-login-pending=([^;]+)/u.exec(cookie as string)?.[1];
   assert.equal(value, pending.handle);
   assert.notEqual(value, state);
   assert.equal((json.location as string).includes(pending.handle), false);
 });
 
 // SameSite=Strict is what makes the cross-site form submission fail: the
-// victim's browser holds a cookie but does not send it. Lax would.
-test('scopes the cookie to the callback and keeps it off cross-site requests', async () => {
+// victim's browser holds a cookie but does not send it. Lax would. The
+// `__Host-` prefix is what stops a sibling host from writing the cookie in the
+// first place, and a browser only honours it for a Secure cookie at Path=/
+// with no Domain — so the three attributes are one property, not three.
+test('locks the cookie to this host and keeps it off cross-site requests', async () => {
   const store = new PendingLoginStore(300000);
   const handler = new OidcRedirectHandler({
     store,
@@ -108,13 +111,18 @@ test('scopes the cookie to the callback and keeps it off cross-site requests', a
   const { metadata } = await handler.handle(input);
   const cookie = String(metadata?.get(namedNode(setCookiePredicate))?.value);
 
+  assert.match(cookie, /^__Host-/u);
+  assert.match(cookie, /; Secure;/u);
+  assert.match(cookie, /; Path=\/;/u);
+  assert.equal(/; ?Domain=/iu.test(cookie), false, 'a __Host- cookie may not name a domain');
   assert.match(cookie, /; SameSite=Strict$/u);
   assert.match(cookie, /; HttpOnly;/u);
-  assert.match(cookie, /; Path=\/\.account\/login\/oidc\/callback\/;/u);
   assert.match(cookie, /; Max-Age=300;/u);
 });
 
-test('lets a deployment name the cookie', async () => {
+// The name the browser is given and the name a deployment maps in the cookie
+// parser are the same field, so a configured name carries the prefix too.
+test('lets a deployment name the cookie, under the same prefix', async () => {
   const store = new PendingLoginStore(600000, 'pod-pending-login');
   const handler = new OidcRedirectHandler({
     store,
@@ -124,5 +132,27 @@ test('lets a deployment name the cookie', async () => {
   });
 
   const { metadata } = await handler.handle(input);
-  assert.match(String(metadata?.get(namedNode(setCookiePredicate))?.value), /^pod-pending-login=/u);
+  assert.match(String(metadata?.get(namedNode(setCookiePredicate))?.value), /^__Host-pod-pending-login=/u);
+  assert.equal(store.cookieName, '__Host-pod-pending-login');
+});
+
+// A browser stores no __Host- cookie over plain HTTP, so every login would end
+// at the callback with a cookie that was never set. Saying so where the login
+// starts is the difference between a misconfigured deployment and a package
+// that looks broken.
+test('refuses to start a login when the callback is not HTTPS', async () => {
+  const handler = new OidcRedirectHandler({
+    store: new PendingLoginStore(),
+    discovery: discovery as never,
+    clientId: 'pod-client',
+    callbackUrl: 'http://localhost:3000/.account/login/oidc/callback/',
+  });
+
+  await assert.rejects(
+    handler.handle(input),
+    (error: unknown): boolean =>
+      (error as { statusCode?: number }).statusCode === 500 &&
+      /only stored by a browser over HTTPS/u.test(String(error)) &&
+      /http:\/\/localhost:3000/u.test(String(error)),
+  );
 });

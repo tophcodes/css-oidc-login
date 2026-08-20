@@ -6,6 +6,7 @@ import {
   OidcCallbackHandler, GRANT_ISSUER_PREDICATE, GRANT_SUBJECT_PREDICATE,
 } from '../src/OidcCallbackHandler.ts';
 import { PendingLoginStore } from '../src/PendingLoginStore.ts';
+import { BEYOND_PATIENCE_MS, DEADLINE_BOUND_MS, endlessBody, neverAnswers } from './bounds.ts';
 
 /** Predicates are read off a store instance, the way the handlers read them. */
 const { cookiePredicate, setCookiePredicate } = new PendingLoginStore();
@@ -233,6 +234,27 @@ test('refuses a callback answered by a browser holding a different login\'s cook
     handler.login(callback({ state: 'victim-state', code: 'c' }, 'attacker-handle')),
     (error: unknown): boolean => isBadRequest(error) && /does not belong to this login/u.test(String(error)),
   );
+});
+
+// Spending the login before the handle is checked would protect only the
+// browser that holds no cookie at all. Anyone with a leaked state and a cookie
+// of their own could still destroy a login in progress, and two logins started
+// in one browser would take each other down.
+test('does not spend the pending login for a caller holding another login\'s cookie', async () => {
+  const { handler, store } = makeHandler(
+    { webid: WEBID, sub: SUBJECT },
+    [{ id: 'l1', webId: WEBID, accountId: 'acc-1' }],
+  );
+  await start(store, 'victim-state', 'victim-handle');
+
+  await assert.rejects(
+    handler.login(callback({ state: 'victim-state', code: 'c' }, 'attacker-handle')),
+    (error: unknown): boolean => isBadRequest(error) && /does not belong to this login/u.test(String(error)),
+  );
+
+  // The victim's own browser can still finish the login it started.
+  const { json } = await handler.login(callback({ state: 'victim-state', code: 'c' }, 'victim-handle'));
+  assert.equal(json.accountId, 'acc-1');
 });
 
 // Login CSRF: the attacker completes a login at the provider themselves, then
@@ -760,7 +782,10 @@ test('refuses the default predicate when another one is configured', async () =>
 // A profile that never answers holds a worker for as long as it likes, and one
 // that never stops holds its memory. The stub below stands in for both.
 
-test('gives up on a profile that does not answer', async () => {
+// The stub does not answer at all, and the deadline is what ends the wait —
+// so the assertion is on how long the wait lasts, not merely on a signal
+// having been handed over. A deadline of an hour holds a worker for an hour.
+test('gives up on a profile that does not answer', { timeout: BEYOND_PATIENCE_MS }, async () => {
   const handler = await profileCheckingHandler('s-timeout');
 
   const original = globalThis.fetch;
@@ -770,14 +795,7 @@ test('gives up on a profile that does not answer', async () => {
         id_token: idToken({ iss: 'https://idp.example', aud: 'pod-client', sub: SUBJECT, webid: WEBID }),
       }), { status: 200 });
     }
-    // A request made without a deadline would wait here forever; rather than
-    // hold the test open for as long as it would hold a worker, the stub
-    // reports what a deadline would have reported, but only if one was asked
-    // for.
-    assert.ok(init?.signal instanceof AbortSignal, 'the profile fetch carries no abort signal');
-    const timeout = new Error('simulated deadline');
-    timeout.name = 'TimeoutError';
-    throw timeout;
+    return neverAnswers(init);
   }) as unknown as typeof fetch;
 
   try {
@@ -790,7 +808,45 @@ test('gives up on a profile that does not answer', async () => {
   }
 });
 
-test('gives up on a profile that keeps sending', async () => {
+// The token endpoint is a host this server waits on just as much as it waits
+// on a profile, and a single worker is a single worker either way.
+test('gives up on a token endpoint that does not answer', { timeout: BEYOND_PATIENCE_MS }, async () => {
+  const handler = await exchangingHandler('s-token-timeout');
+
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (_input: unknown, init?: { signal?: AbortSignal }) =>
+    neverAnswers(init)) as unknown as typeof fetch;
+
+  try {
+    await assert.rejects(
+      handler.login(callback({ state: 's-token-timeout', code: 'c' })),
+      (error: unknown): boolean => isBadRequest(error) && /did not answer within/u.test(String(error)),
+    );
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('gives up on a token endpoint that keeps sending', { timeout: DEADLINE_BOUND_MS }, async () => {
+  const handler = await exchangingHandler('s-token-huge');
+
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => endlessBody('application/json')) as unknown as typeof fetch;
+
+  try {
+    await assert.rejects(
+      handler.login(callback({ state: 's-token-huge', code: 'c' })),
+      (error: unknown): boolean => isBadRequest(error) && /is larger than/u.test(String(error)),
+    );
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+// The body never ends, so only an implementation that counts as it reads ever
+// returns from here. One that buffers the whole body and looks at its size
+// afterwards runs until this test gives up on it.
+test('gives up on a profile that keeps sending', { timeout: DEADLINE_BOUND_MS }, async () => {
   const handler = await profileCheckingHandler('s-huge');
 
   const original = globalThis.fetch;
@@ -800,21 +856,7 @@ test('gives up on a profile that keeps sending', async () => {
         id_token: idToken({ iss: 'https://idp.example', aud: 'pod-client', sub: SUBJECT, webid: WEBID }),
       }), { status: 200 });
     }
-    const chunk = new TextEncoder().encode('#'.repeat(65536));
-    let sent = 0;
-    const body = new ReadableStream({
-      pull(controller): void {
-        sent += 1;
-        // Well past any real profile, and bounded only so that an
-        // implementation without a cap fails the assertion instead of the run.
-        if (sent > 64) {
-          controller.close();
-          return;
-        }
-        controller.enqueue(chunk);
-      },
-    });
-    return new Response(body, { status: 200, headers: { 'content-type': 'text/turtle' }});
+    return endlessBody('text/turtle');
   }) as unknown as typeof fetch;
 
   try {

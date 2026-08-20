@@ -6,6 +6,7 @@ import type {
   AccountStore, CookieStore, JsonInteractionHandlerInput,
   JsonRepresentation, LoginOutputType,
 } from '@solid/community-server';
+import { readCapped, RESPONSE_MAX_BYTES, RESPONSE_TIMEOUT_MS } from './limits.ts';
 import type { OidcDiscovery } from './OidcDiscovery.js';
 import type { PendingLoginStore } from './PendingLoginStore.js';
 
@@ -19,15 +20,6 @@ const WEBID_STORAGE_TYPE = 'webIdLink';
 
 /** The only serialisation a profile is read as; anything else is refused. */
 const PROFILE_MEDIA_TYPE = 'text/turtle';
-
-/**
- * How long a profile has to answer, and how much of it is read. A WebID
- * profile is a handful of triples; both limits are orders of magnitude above
- * that and still bounded, so one unresponsive or endless host cannot occupy a
- * worker or its memory.
- */
-const PROFILE_TIMEOUT_MS = 5000;
-const PROFILE_MAX_BYTES = 1048576;
 
 /**
  * Predicate a profile uses to attach a grant to its WebID. Its own term
@@ -91,8 +83,8 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
       throw new BadRequestHttpError('Callback carried no code.');
     }
 
-    // Read before the state is spent: a caller that cannot produce the cookie
-    // must not be able to burn somebody else's login in progress.
+    // The cookie is the browser's half of the login, and the half an attacker
+    // holding a state and a code does not have.
     const { store } = this.args;
     const handle = metadata.get(namedNode(store.cookiePredicate))?.value;
     if (!handle) {
@@ -102,15 +94,18 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
       );
     }
 
-    const pending = await store.consume(state);
+    // Read without spending. The state alone proves only that some browser
+    // started this login, so spending it before the handle is checked would
+    // let anyone holding a leaked state destroy a login in progress. Only the
+    // browser that started it gets to spend it.
+    const pending = await store.peek(state);
     if (!pending) {
       throw new BadRequestHttpError('Unknown or expired state.');
     }
-    // The state alone proves only that some browser started this login. Whoever
-    // answers the callback has to be the browser that did.
     if (!secretsMatch(handle, pending.handle)) {
       throw new BadRequestHttpError('The pending-login cookie does not belong to this login.');
     }
+    await store.consume(state);
 
     const claims = await this.exchange(code, pending.codeVerifier);
     const claimName = this.args.webIdClaim ?? 'webid';
@@ -156,19 +151,29 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
     const { token } = await this.args.discovery.endpoints();
     // A 307 or 308 replays this POST — client secret, code and verifier
     // included — at whatever host the response names. Refused, not followed.
-    const response = await fetch(token, {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      redirect: 'manual',
-      body: new URLSearchParams({
-        grant_type: 'authorization_code',
-        code,
-        redirect_uri: this.args.callbackUrl,
-        client_id: this.args.clientId,
-        client_secret: this.args.clientSecret,
-        code_verifier: codeVerifier,
-      }),
-    });
+    let response: Response;
+    try {
+      response = await fetch(token, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        redirect: 'manual',
+        signal: AbortSignal.timeout(RESPONSE_TIMEOUT_MS),
+        body: new URLSearchParams({
+          grant_type: 'authorization_code',
+          code,
+          redirect_uri: this.args.callbackUrl,
+          client_id: this.args.clientId,
+          client_secret: this.args.clientSecret,
+          code_verifier: codeVerifier,
+        }),
+      });
+    } catch (error) {
+      const name = (error as { name?: string }).name;
+      if (name === 'TimeoutError' || name === 'AbortError') {
+        throw new BadRequestHttpError(`The token endpoint did not answer within ${RESPONSE_TIMEOUT_MS}ms.`);
+      }
+      throw new BadRequestHttpError('The token endpoint could not be reached.');
+    }
     if (response.status >= 300 && response.status < 400) {
       throw new BadRequestHttpError(
         'The token endpoint redirects elsewhere; the exchange has to happen at the endpoint discovery named.',
@@ -178,7 +183,10 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
       throw new BadRequestHttpError(`Token exchange failed with ${response.status}.`);
     }
 
-    const body = await response.json() as { id_token?: string };
+    const body = this.parseTokenResponse(await readCapped(
+      response,
+      (): Error => new BadRequestHttpError(`The token response is larger than ${RESPONSE_MAX_BYTES} bytes.`),
+    ));
     if (!body.id_token) {
       throw new BadRequestHttpError('Token response carried no ID token.');
     }
@@ -193,6 +201,19 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
 
     this.assertIssuedForUs(claims);
     return claims;
+  }
+
+  private parseTokenResponse(body: string): { id_token?: string } {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      throw new BadRequestHttpError('Token response is not valid JSON.');
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new BadRequestHttpError('Token response is not a JSON object.');
+    }
+    return parsed as { id_token?: string };
   }
 
   /**
@@ -325,7 +346,7 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
       response = await fetch(webId, {
         headers: { accept: PROFILE_MEDIA_TYPE },
         redirect: 'manual',
-        signal: AbortSignal.timeout(PROFILE_TIMEOUT_MS),
+        signal: AbortSignal.timeout(RESPONSE_TIMEOUT_MS),
       });
     } catch (error) {
       throw new BadRequestHttpError(this.describeProfileFailure(webId, error));
@@ -350,39 +371,26 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
     return this.readCapped(webId, response);
   }
 
-  /**
-   * Reads a body while counting bytes, so a response that never ends or that
-   * lies about its length still costs a bounded amount of memory.
-   */
+  /** Reads the profile body, refusing one that never stops arriving. */
   private async readCapped(webId: string, response: Response): Promise<string> {
-    if (!response.body) {
-      return '';
-    }
-
-    const decoder = new TextDecoder();
-    let read = 0;
-    let text = '';
     try {
-      for await (const chunk of response.body as unknown as AsyncIterable<Uint8Array>) {
-        read += chunk.byteLength;
-        if (read > PROFILE_MAX_BYTES) {
-          throw new BadRequestHttpError(`The profile at ${webId} is larger than ${PROFILE_MAX_BYTES} bytes.`);
-        }
-        text += decoder.decode(chunk, { stream: true });
-      }
+      return await readCapped(
+        response,
+        (): Error =>
+          new BadRequestHttpError(`The profile at ${webId} is larger than ${RESPONSE_MAX_BYTES} bytes.`),
+      );
     } catch (error) {
       if (BadRequestHttpError.isInstance(error)) {
         throw error;
       }
       throw new BadRequestHttpError(this.describeProfileFailure(webId, error));
     }
-    return text + decoder.decode();
   }
 
   private describeProfileFailure(webId: string, error: unknown): string {
     const name = (error as { name?: string }).name;
     if (name === 'TimeoutError' || name === 'AbortError') {
-      return `The profile at ${webId} did not answer within ${PROFILE_TIMEOUT_MS}ms.`;
+      return `The profile at ${webId} did not answer within ${RESPONSE_TIMEOUT_MS}ms.`;
     }
     return `Could not read the profile at ${webId}.`;
   }

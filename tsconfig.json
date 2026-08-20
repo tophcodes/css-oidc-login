@@ -8,6 +8,13 @@
     "rootDir": "src",
     "declaration": true,
     "strict": true,
+    // A relative import naming a `.ts` file is what Node's type stripping
+    // resolves when the tests run against src/, and these two rewrite it to
+    // `.js` on the way into dist/. A runtime import written as `./x.js`
+    // resolves in dist/ but not in the test run, so relative imports that
+    // survive erasure name the `.ts` file.
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true

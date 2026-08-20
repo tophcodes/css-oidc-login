@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { OidcDiscovery } from '../src/OidcDiscovery.ts';
+import { BEYOND_PATIENCE_MS, DEADLINE_BOUND_MS, endlessBody, neverAnswers } from './bounds.ts';
 
 const withFetch = async (impl: typeof fetch, fn: () => Promise<void>): Promise<void> => {
   const original = globalThis.fetch;
@@ -115,5 +116,26 @@ test('fails loudly when discovery is unreachable', async () => {
   await withFetch(impl, async () => {
     const discovery = new OidcDiscovery('https://idp.example');
     await assert.rejects(discovery.endpoints(), /404/u);
+  });
+});
+
+// Discovery is the first thing a login touches, and it waits on a host this
+// server does not control just as the profile fetch does.
+test('gives up on an issuer that does not answer', { timeout: BEYOND_PATIENCE_MS }, async () => {
+  const impl = (async (_input: unknown, init?: { signal?: AbortSignal }) =>
+    neverAnswers(init)) as unknown as typeof fetch;
+
+  await withFetch(impl, async () => {
+    const discovery = new OidcDiscovery('https://idp.example');
+    await assert.rejects(discovery.endpoints(), /did not answer within/u);
+  });
+});
+
+test('gives up on a discovery document that keeps sending', { timeout: DEADLINE_BOUND_MS }, async () => {
+  const impl = (async () => endlessBody('application/json')) as unknown as typeof fetch;
+
+  await withFetch(impl, async () => {
+    const discovery = new OidcDiscovery('https://idp.example');
+    await assert.rejects(discovery.endpoints(), /is larger than/u);
   });
 });
