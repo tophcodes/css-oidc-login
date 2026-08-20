@@ -1,6 +1,7 @@
 import { randomBytes, createHash } from 'node:crypto';
-import { JsonInteractionHandler } from '@solid/community-server';
-import type { JsonRepresentation } from '@solid/community-server';
+import { DataFactory } from 'n3';
+import { JsonInteractionHandler, RepresentationMetadata } from '@solid/community-server';
+import type { JsonInteractionHandlerInput, JsonRepresentation } from '@solid/community-server';
 import type { OidcDiscovery } from './OidcDiscovery.js';
 import type { PendingLoginStore } from './PendingLoginStore.js';
 
@@ -24,14 +25,18 @@ export class OidcRedirectHandler extends JsonInteractionHandler {
     this.args = args;
   }
 
-  public async handle(): Promise<JsonRepresentation> {
+  public async handle({ target }: JsonInteractionHandlerInput): Promise<JsonRepresentation> {
     const { authorization } = await this.args.discovery.endpoints();
 
     const state = base64url(randomBytes(32));
     const codeVerifier = base64url(randomBytes(32));
     const codeChallenge = base64url(createHash('sha256').update(codeVerifier).digest());
+    // The state travels through the provider and is therefore known to anyone
+    // who gets to see the callback URL. The handle only ever travels between
+    // this server and one browser, which is what the callback checks.
+    const handle = base64url(randomBytes(32));
 
-    await this.args.store.create(state, { codeVerifier });
+    await this.args.store.create(state, { codeVerifier, handle });
 
     const url = new URL(authorization);
     url.searchParams.set('response_type', 'code');
@@ -42,6 +47,12 @@ export class OidcRedirectHandler extends JsonInteractionHandler {
     url.searchParams.set('code_challenge', codeChallenge);
     url.searchParams.set('code_challenge_method', 'S256');
 
-    return { json: { location: url.href }};
+    const metadata = new RepresentationMetadata(target);
+    metadata.add(
+      DataFactory.namedNode(this.args.store.setCookiePredicate),
+      this.args.store.cookie(handle, this.args.callbackUrl),
+    );
+
+    return { json: { location: url.href }, metadata };
   }
 }
