@@ -156,3 +156,32 @@ test('refuses to start a login when the callback is not HTTPS', async () => {
       /http:\/\/localhost:3000/u.test(String(error)),
   );
 });
+
+// The HTML view only answers a GET that prefers HTML over JSON, so a GET
+// carrying `Accept: */*` — curl, a crawler, a cross-site `<img src>` — falls
+// through to this handler. Starting a login for it would write a pending entry
+// and hand out a cookie that replaces the one a login already in flight in
+// that browser needs, which costs its owner their login.
+test('refuses to start a login on a GET', async () => {
+  const store = new PendingLoginStore();
+  const created: string[] = [];
+  store.create = async (state: string): Promise<void> => {
+    created.push(state);
+  };
+  const handler = new OidcRedirectHandler({
+    store,
+    discovery: discovery as never,
+    clientId: 'pod-client',
+    callbackUrl: 'https://pod.example/.account/login/oidc/callback/',
+  });
+  const get = { method: 'GET', target, json: {}, metadata: {}} as never;
+
+  const isMethodNotAllowed = (error: unknown): boolean =>
+    (error as { statusCode?: number }).statusCode === 405;
+
+  // Both halves: what a waterfall consults before it picks a handler, and the
+  // one a wrapper that has already made its own choice calls directly.
+  await assert.rejects(handler.handleSafe(get), isMethodNotAllowed);
+  await assert.rejects(handler.handle(get), isMethodNotAllowed);
+  assert.deepEqual(created, [], 'a GET started a login');
+});

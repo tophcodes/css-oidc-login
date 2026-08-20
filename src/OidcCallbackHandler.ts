@@ -7,6 +7,7 @@ import type {
   JsonRepresentation, LoginOutputType,
 } from '@solid/community-server';
 import { readCapped, RESPONSE_MAX_BYTES, RESPONSE_TIMEOUT_MS } from './limits.ts';
+import { assertPostOnly } from './methods.ts';
 import type { OidcDiscovery } from './OidcDiscovery.js';
 import type { PendingLoginStore } from './PendingLoginStore.js';
 
@@ -72,9 +73,15 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
     this.args = args;
   }
 
+  public async canHandle({ method }: JsonInteractionHandlerInput): Promise<void> {
+    assertPostOnly(method);
+  }
+
   public async login(
-    { json, metadata, target }: JsonInteractionHandlerInput,
+    { method, json, metadata, target }: JsonInteractionHandlerInput,
   ): Promise<JsonRepresentation<LoginOutputType>> {
+    assertPostOnly(method);
+
     const { state, code } = json as { state?: string; code?: string };
     if (!state) {
       throw new BadRequestHttpError('Callback carried no state.');

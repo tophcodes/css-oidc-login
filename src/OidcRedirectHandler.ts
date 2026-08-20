@@ -2,6 +2,7 @@ import { randomBytes, createHash } from 'node:crypto';
 import { DataFactory } from 'n3';
 import { JsonInteractionHandler, RepresentationMetadata } from '@solid/community-server';
 import type { JsonInteractionHandlerInput, JsonRepresentation } from '@solid/community-server';
+import { assertPostOnly } from './methods.ts';
 import type { OidcDiscovery } from './OidcDiscovery.js';
 import type { PendingLoginStore } from './PendingLoginStore.js';
 
@@ -25,7 +26,17 @@ export class OidcRedirectHandler extends JsonInteractionHandler {
     this.args = args;
   }
 
-  public async handle({ target }: JsonInteractionHandlerInput): Promise<JsonRepresentation> {
+  public async canHandle({ method }: JsonInteractionHandlerInput): Promise<void> {
+    assertPostOnly(method);
+  }
+
+  public async handle({ method, target }: JsonInteractionHandlerInput): Promise<JsonRepresentation> {
+    // A login starts here: an entry is written and a cookie is handed out. A
+    // GET that reached this far — a crawler, an image tag, anything sending
+    // `Accept: */*` past the HTML view — would overwrite the cookie of a login
+    // this browser has in flight and take its owner's login with it.
+    assertPostOnly(method);
+
     const { authorization } = await this.args.discovery.endpoints();
 
     const state = base64url(randomBytes(32));

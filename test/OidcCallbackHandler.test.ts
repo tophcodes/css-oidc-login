@@ -900,3 +900,26 @@ test('clears the pending-login cookie once the login is redeemed', async () => {
   const header = metadata?.get(namedNode(setCookiePredicate))?.value;
   assert.match(String(header), /Max-Age=0/u);
 });
+
+// Same exposure as the start route: a GET that prefers no particular type gets
+// past the HTML view and reaches this handler.
+test('refuses to complete a login on a GET', async () => {
+  const { handler, store } = makeHandler(
+    { webid: WEBID, sub: SUBJECT },
+    [{ id: 'l1', webId: WEBID, accountId: 'acc-1' }],
+  );
+  await start(store, 's-get');
+
+  const metadata = new RepresentationMetadata(TARGET);
+  metadata.add(namedNode(cookiePredicate), HANDLE);
+  const get = { method: 'GET', target: TARGET, json: { state: 's-get', code: 'c' }, metadata } as never;
+
+  const isMethodNotAllowed = (error: unknown): boolean =>
+    (error as { statusCode?: number }).statusCode === 405;
+
+  await assert.rejects(handler.handleSafe(get), isMethodNotAllowed);
+  await assert.rejects(handler.login(get), isMethodNotAllowed);
+  // The login it named is untouched, so the browser that started it can still
+  // finish it.
+  assert.ok(await store.peek('s-get'));
+});
