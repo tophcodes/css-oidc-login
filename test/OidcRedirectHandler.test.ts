@@ -157,12 +157,40 @@ test('refuses to start a login when the callback is not HTTPS', async () => {
   );
 });
 
+// A store with no room refuses rather than making room, so the browser that
+// started a login and is away at the provider keeps it. What the person who
+// asked for the login that could not be taken sees is this: a server that is
+// momentarily out of room, not a request of theirs that was wrong.
+test('turns a login away when the store has no room left for it', async () => {
+  const store = new PendingLoginStore(600000, 'pending', 1);
+  const handler = new OidcRedirectHandler({
+    store,
+    discovery: discovery as never,
+    clientId: 'pod-client',
+    callbackUrl: 'https://pod.example/.account/login/oidc/callback/',
+  });
+
+  const first = new URL((await handler.handle(input)).json.location as string);
+
+  await assert.rejects(
+    handler.handle(input),
+    (error: unknown): boolean => (error as { statusCode?: number }).statusCode === 503,
+  );
+  assert.ok(
+    await store.peek(first.searchParams.get('state') as string),
+    'the login that was already in progress was taken away',
+  );
+});
+
 // The HTML view only answers a GET that prefers HTML over JSON, so a GET
 // carrying `Accept: */*` — curl, a crawler, a cross-site `<img src>` — falls
 // through to this handler. Starting a login for it would write a pending entry
 // and hand out a cookie that replaces the one a login already in flight in
-// that browser needs, which costs its owner their login.
-test('refuses to start a login on a GET', async () => {
+// that browser needs, which costs its owner their login. GET is the method
+// that gets here by accident, but it is not the claim: the claim is that POST
+// is the only method that starts a login, so a method that is neither is
+// refused too.
+test('starts a login on a POST and on nothing else', async () => {
   const store = new PendingLoginStore();
   const created: string[] = [];
   store.create = async (state: string): Promise<void> => {
@@ -174,14 +202,19 @@ test('refuses to start a login on a GET', async () => {
     clientId: 'pod-client',
     callbackUrl: 'https://pod.example/.account/login/oidc/callback/',
   });
-  const get = { method: 'GET', target, json: {}, metadata: {}} as never;
 
   const isMethodNotAllowed = (error: unknown): boolean =>
     (error as { statusCode?: number }).statusCode === 405;
 
-  // Both halves: what a waterfall consults before it picks a handler, and the
-  // one a wrapper that has already made its own choice calls directly.
-  await assert.rejects(handler.handleSafe(get), isMethodNotAllowed);
-  await assert.rejects(handler.handle(get), isMethodNotAllowed);
-  assert.deepEqual(created, [], 'a GET started a login');
+  for (const method of ['GET', 'HEAD', 'PUT', 'DELETE', 'PATCH']) {
+    const other = { method, target, json: {}, metadata: {}} as never;
+    // Both halves: what a waterfall consults before it picks a handler, and
+    // the one a wrapper that has already made its own choice calls directly.
+    await assert.rejects(handler.handleSafe(other), isMethodNotAllowed, `${method} was not refused`);
+    await assert.rejects(handler.handle(other), isMethodNotAllowed, `${method} was not refused`);
+    assert.deepEqual(created, [], `a ${method} started a login`);
+  }
+
+  await handler.handle(input);
+  assert.equal(created.length, 1, 'a POST did not start a login');
 });

@@ -26,10 +26,6 @@ export class OidcRedirectHandler extends JsonInteractionHandler {
     this.args = args;
   }
 
-  public async canHandle({ method }: JsonInteractionHandlerInput): Promise<void> {
-    assertPostOnly(method);
-  }
-
   public async handle({ method, target }: JsonInteractionHandlerInput): Promise<JsonRepresentation> {
     // A login starts here: an entry is written and a cookie is handed out. A
     // GET that reached this far — a crawler, an image tag, anything sending
