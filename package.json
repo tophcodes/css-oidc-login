@@ -9,6 +9,16 @@
   "files": ["dist"],
   "lsd:module": true,
   "lsd:basePath": "dist/",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devEngines": {
+    "runtime": {
+      "name": "node",
+      "version": ">=22.7.0",
+      "onFail": "error"
+    }
+  },
   "scripts": {
     "build": "tsc && componentsjs-generator -s dist -c dist/components -i .componentsignore -r co",
     "test": "node --test --experimental-strip-types test/**/*.test.ts"
