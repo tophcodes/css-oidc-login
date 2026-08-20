@@ -1,9 +1,21 @@
+import { HttpError } from '@solid/community-server';
 import { readCapped, RESPONSE_MAX_BYTES, RESPONSE_TIMEOUT_MS } from './limits.ts';
 
 export interface OidcEndpoints {
   authorization: string;
   token: string;
 }
+
+/**
+ * Nothing that goes wrong here is anything a caller sent: the issuer is
+ * configured, the document is the provider's, and a login only ever arrives
+ * after it. So a failure is reported as one of the provider's rather than as a
+ * bad request — 502 for a provider that answered badly, and 504 for one that
+ * did not answer within the deadline, which is a wait rather than an answer
+ * and the one case an operator can tell apart at a glance.
+ */
+const providerFailed = (message: string): HttpError => new HttpError(502, 'BadGatewayHttpError', message);
+const providerTimedOut = (message: string): HttpError => new HttpError(504, 'GatewayTimeoutHttpError', message);
 
 /** Issuer identifiers are compared without their trailing slashes. */
 const withoutTrailingSlashes = (iri: string): string => iri.replace(/\/*$/u, '');
@@ -31,22 +43,22 @@ export class OidcDiscovery {
     } catch (error) {
       const name = (error as { name?: string }).name;
       if (name === 'TimeoutError' || name === 'AbortError') {
-        throw new Error(`Discovery for ${this.issuer} did not answer within ${RESPONSE_TIMEOUT_MS}ms.`);
+        throw providerTimedOut(`Discovery for ${this.issuer} did not answer within ${RESPONSE_TIMEOUT_MS}ms.`);
       }
-      throw new Error(`Discovery for ${this.issuer} could not be read.`);
+      throw providerFailed(`Discovery for ${this.issuer} could not be read.`);
     }
     if (response.status >= 300 && response.status < 400) {
-      throw new Error(
+      throw providerFailed(
         `Discovery for ${this.issuer} redirects elsewhere; the document has to be served from the issuer itself.`,
       );
     }
     if (!response.ok) {
-      throw new Error(`Discovery for ${this.issuer} failed with ${response.status}.`);
+      throw providerFailed(`Discovery for ${this.issuer} failed with ${response.status}.`);
     }
 
     const document = this.parse(await readCapped(
       response,
-      (): Error => new Error(`Discovery for ${this.issuer} is larger than ${RESPONSE_MAX_BYTES} bytes.`),
+      (): Error => providerFailed(`Discovery for ${this.issuer} is larger than ${RESPONSE_MAX_BYTES} bytes.`),
     ));
     const issuer = document.issuer;
     const authorization = document.authorization_endpoint;
@@ -54,16 +66,16 @@ export class OidcDiscovery {
     // A document naming another issuer describes another provider, whatever URL
     // it was served from.
     if (typeof issuer !== 'string') {
-      throw new Error(`Discovery for ${this.issuer} carried no issuer.`);
+      throw providerFailed(`Discovery for ${this.issuer} carried no issuer.`);
     }
     if (withoutTrailingSlashes(issuer) !== withoutTrailingSlashes(this.issuer)) {
-      throw new Error(`Discovery for ${this.issuer} names ${issuer} as its issuer.`);
+      throw providerFailed(`Discovery for ${this.issuer} names ${issuer} as its issuer.`);
     }
     if (typeof authorization !== 'string') {
-      throw new Error(`Discovery for ${this.issuer} carried no authorization_endpoint.`);
+      throw providerFailed(`Discovery for ${this.issuer} carried no authorization_endpoint.`);
     }
     if (typeof token !== 'string') {
-      throw new Error(`Discovery for ${this.issuer} carried no token_endpoint.`);
+      throw providerFailed(`Discovery for ${this.issuer} carried no token_endpoint.`);
     }
 
     this.cached = { authorization, token };
@@ -75,10 +87,10 @@ export class OidcDiscovery {
     try {
       document = JSON.parse(body);
     } catch {
-      throw new Error(`Discovery for ${this.issuer} is not valid JSON.`);
+      throw providerFailed(`Discovery for ${this.issuer} is not valid JSON.`);
     }
     if (typeof document !== 'object' || document === null || Array.isArray(document)) {
-      throw new Error(`Discovery for ${this.issuer} is not a JSON object.`);
+      throw providerFailed(`Discovery for ${this.issuer} is not a JSON object.`);
     }
     return document as Record<string, unknown>;
   }

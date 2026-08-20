@@ -139,3 +139,42 @@ test('gives up on a discovery document that keeps sending', { timeout: DEADLINE_
     await assert.rejects(discovery.endpoints(), /is larger than/u);
   });
 });
+
+const statusOf = (error: unknown): number | undefined => (error as { statusCode?: number }).statusCode;
+
+// Discovery reads nothing a caller sent: the issuer is configuration and the
+// document is the provider's. So a refusal here is the provider's failure and
+// says so with a status of its own, rather than blaming the request or being
+// filed as a fault of this server.
+test('blames the provider, not the caller, for a discovery document it will not accept', async () => {
+  const impl = (async () => new Response('nope', { status: 404 })) as unknown as typeof fetch;
+
+  await withFetch(impl, async () => {
+    const discovery = new OidcDiscovery('https://idp.example');
+    await assert.rejects(discovery.endpoints(), (error: unknown): boolean => statusOf(error) === 502);
+  });
+});
+
+test('blames the provider for a document that is not the JSON it has to be', async () => {
+  const impl = (async () => new Response('<html>', { status: 200 })) as unknown as typeof fetch;
+
+  await withFetch(impl, async () => {
+    const discovery = new OidcDiscovery('https://idp.example');
+    await assert.rejects(discovery.endpoints(), (error: unknown): boolean => statusOf(error) === 502);
+  });
+});
+
+// A provider that never answers is a different failure from one that answered
+// badly, and the only one an operator can act on without reading a log.
+test('reports an issuer that does not answer as a timeout of its own', async () => {
+  const impl = (async () => {
+    const error = new Error('timed out');
+    error.name = 'TimeoutError';
+    throw error;
+  }) as unknown as typeof fetch;
+
+  await withFetch(impl, async () => {
+    const discovery = new OidcDiscovery('https://idp.example');
+    await assert.rejects(discovery.endpoints(), (error: unknown): boolean => statusOf(error) === 504);
+  });
+});
