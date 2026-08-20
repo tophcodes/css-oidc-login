@@ -4,8 +4,8 @@ import type {
   AccountStore, CookieStore, JsonInteractionHandlerInput,
   JsonRepresentation, LoginOutputType,
 } from '@solid/community-server';
-import type { OidcDiscovery } from './OidcDiscovery';
-import type { PendingLoginStore } from './PendingLoginStore';
+import type { OidcDiscovery } from './OidcDiscovery.js';
+import type { PendingLoginStore } from './PendingLoginStore.js';
 
 /** Defined by the server's BaseWebIdStore, which also indexes `webId`. */
 const WEBID_STORAGE_TYPE = 'webIdLink';

@@ -1,8 +1,8 @@
 import { randomBytes, createHash } from 'node:crypto';
 import { JsonInteractionHandler } from '@solid/community-server';
 import type { JsonRepresentation } from '@solid/community-server';
-import type { OidcDiscovery } from './OidcDiscovery';
-import type { PendingLoginStore } from './PendingLoginStore';
+import type { OidcDiscovery } from './OidcDiscovery.js';
+import type { PendingLoginStore } from './PendingLoginStore.js';
 
 export interface OidcRedirectHandlerArgs {
   store: PendingLoginStore;
