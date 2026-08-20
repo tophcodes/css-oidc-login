@@ -976,7 +976,15 @@ test('refuses a configured trust predicate that could never be one', async () =>
           `a trust predicate of ${predicate} was reported as ${statusOf(error)}`,
         );
         assert.match(String(error), /configured trust predicate .*is not an absolute IRI/u);
-        assert.ok(String(error).includes(predicate), `the refusal does not name ${predicate}`);
+        if (predicate === '') {
+          // An empty value is a substring of every message, so naming it is
+          // not something a message can fail at. What the refusal has to show
+          // is the gap where the value would be, which is what tells an
+          // operator the setting is present and empty rather than unset.
+          assert.match(String(error), /configured trust predicate {2}is not an absolute IRI/u);
+        } else {
+          assert.ok(String(error).includes(predicate), `the refusal does not name ${predicate}`);
+        }
         return true;
       },
     );
