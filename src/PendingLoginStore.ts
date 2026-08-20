@@ -1,15 +1,9 @@
-import { HttpError, InternalServerError } from '@solid/community-server';
+import { DataFactory } from 'n3';
+import {
+  getLoggerFor, HttpError, InternalServerError, RepresentationMetadata,
+} from '@solid/community-server';
 
-/**
- * A store with no room left is a server that is momentarily out of a resource,
- * not a caller who asked for something wrong: the request that meets a full
- * store is the same request that would have been accepted a moment earlier and
- * will be again once the logins in progress finish or expire. So it is refused
- * as a condition of this server that passes, with the status that says exactly
- * that.
- */
-const outOfRoom = (message: string): HttpError =>
-  new HttpError(503, 'ServiceUnavailableHttpError', message);
+const { namedNode } = DataFactory;
 
 export interface PendingLogin {
   codeVerifier: string;
@@ -97,6 +91,17 @@ export class PendingLoginStore {
    */
   public readonly setCookiePredicate = 'urn:css-oidc-login:http:setPendingLoginCookie';
 
+  /**
+   * Predicate carrying the `Retry-After` value of a refusal. A deployment maps
+   * this IRI to the `Retry-After` header in the server's header-mapping
+   * writer, the same way it maps {@link setCookiePredicate}. Unmapped, a
+   * caller meeting a full store is told to come back later without being told
+   * when, which costs them a wait and nobody anything else.
+   */
+  public readonly retryAfterPredicate = 'urn:css-oidc-login:http:retryAfter';
+
+  private readonly logger = getLoggerFor(this);
+
   public constructor(ttlMs = 600000, cookieName = 'css-oidc-login-pending', maxPending = 10000) {
     this.ttlMs = ttlMs;
     this.cookieName = cookieName.startsWith(HOST_PREFIX) ? cookieName : `${HOST_PREFIX}${cookieName}`;
@@ -119,13 +124,47 @@ export class PendingLoginStore {
    */
   public async create(state: string, data: PendingLogin): Promise<void> {
     this.reclaim();
-    if (this.pending.size >= this.maxPending) {
-      throw outOfRoom(
-        `This server is holding ${this.maxPending} logins in progress and cannot take another one. ` +
-        'Try again in a few minutes.',
-      );
+    // A state already in the store gets a later expiry, so it has to leave its
+    // place rather than keep it: {@link reclaim} stops at the first entry that
+    // is still live, which reclaims everything expired only while the order
+    // entries sit in is the order they expire in. Taking it out and putting it
+    // back is what holds the two in the same order by construction rather than
+    // by nobody ever asking twice. Room it already occupies is room it keeps,
+    // so a store with none left refuses only what is new to it — anything else
+    // would let whoever learns a state, which travels through the provider,
+    // end that login by asking for it again while the store is full.
+    const held = this.pending.delete(state);
+    if (!held && this.pending.size >= this.maxPending) {
+      // How full the store is, and therefore what a flood costs and when the
+      // next one lands, is measurable by anyone who is told the number, and
+      // nothing authenticates the route that fills it. The operator is the one
+      // who can act on it.
+      this.logger.warn(`Refusing a login: ${this.maxPending} logins are already in progress.`);
+      throw this.outOfRoom();
     }
     this.pending.set(state, { data, expires: Date.now() + this.ttlMs });
+  }
+
+  /**
+   * A store with no room left is a server that is momentarily out of a
+   * resource, not a caller who asked for something wrong: the request that
+   * meets a full store is the same request that would have been accepted a
+   * moment earlier and will be again once the logins in progress finish or
+   * expire. So it is refused as a condition of this server that passes, with
+   * the status that says exactly that — and, because it passes on its own, with
+   * how long it takes at the outside. Every entry is gone within one TTL of
+   * being written, so that is the wait after which the store has room again
+   * even if nobody completes a login and nobody else stops asking.
+   */
+  private outOfRoom(): HttpError {
+    const metadata = new RepresentationMetadata();
+    metadata.add(namedNode(this.retryAfterPredicate), `${Math.max(0, Math.ceil(this.ttlMs / 1000))}`);
+    return new HttpError(
+      503,
+      'ServiceUnavailableHttpError',
+      'This server cannot take another login right now. Try again in a few minutes.',
+      { metadata },
+    );
   }
 
   /**

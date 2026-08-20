@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout } from 'node:timers/promises';
+import { DataFactory } from 'n3';
 import { PendingLoginStore } from '../src/PendingLoginStore.ts';
 
 test('returns the stored login once and then forgets it', async () => {
@@ -151,4 +152,66 @@ test('makes room out of expired logins rather than out of the cap', async () => 
   for (let i = 0; i < 4; i++) {
     assert.ok(await store.peek(`live-${i}`), `live-${i} was evicted`);
   }
+});
+
+// What a refusal says is said to whoever asked, and nothing authenticates the
+// asking. The cap is the size of the store: a caller told the number knows what
+// a flood costs and can tell from a single refusal how close the store already
+// is, which is the measurement a flood needs and the wait costs them nothing.
+test('does not tell the caller how much room the store has', async () => {
+  const cap = 3;
+  const store = new PendingLoginStore(600000, 'pending', cap);
+  for (let i = 0; i < cap; i++) {
+    await store.create(`held-${i}`, { codeVerifier: 'v', handle: 'h' });
+  }
+
+  await assert.rejects(
+    store.create('one-too-many', { codeVerifier: 'v', handle: 'h' }),
+    (error: unknown): boolean => !new RegExp(`\\b${cap}\\b`, 'u').test(String(error)),
+  );
+});
+
+// The condition passes on its own, and every entry is gone within one TTL of
+// being written even if nobody completes a login. So the refusal can say how
+// long the wait is at the outside, which is what turns "try again later" into
+// something a client can act on without guessing.
+test('says how long the wait for room is at the outside', async () => {
+  const store = new PendingLoginStore(600000, 'pending', 1);
+  await store.create('the-one-it-holds', { codeVerifier: 'v', handle: 'h' });
+
+  await assert.rejects(
+    store.create('one-too-many', { codeVerifier: 'v', handle: 'h' }),
+    (error: unknown): boolean => {
+      const retryAfter = (error as { metadata?: { get: (term: unknown) => { value: string } | undefined }})
+        .metadata?.get(DataFactory.namedNode(store.retryAfterPredicate));
+      return retryAfter?.value === '600';
+    },
+  );
+});
+
+// Reclaiming walks the store from the front and stops at the first entry that
+// is still live, which reclaims everything expired only while the order entries
+// sit in is the order they expire in. Writing a state that is already there
+// gives it a later expiry, so it has to move to the back as well — otherwise a
+// live entry sits in front of expired ones and the room they hold is never
+// given back, and the store starts refusing logins it has room for.
+test('keeps the store reclaimable when a state is written again', async () => {
+  const ttl = 1000;
+  const store = new PendingLoginStore(ttl, 'pending', 2);
+
+  await store.create('first', { codeVerifier: 'v1', handle: 'h1' });
+  await setTimeout(600);
+  await store.create('second', { codeVerifier: 'v2', handle: 'h2' });
+  await setTimeout(200);
+  // The same login again, the way a browser that starts one twice would: it
+  // now expires after `second` does, whatever order it was written in.
+  await store.create('first', { codeVerifier: 'v1', handle: 'h1' });
+
+  // A moment at which `second` has expired and the rewritten `first` has not.
+  await setTimeout(900);
+
+  await store.create('third', { codeVerifier: 'v3', handle: 'h3' });
+  assert.ok(await store.peek('third'), 'the expired login never gave its room back');
+  assert.ok(await store.peek('first'), 'the login that was written again was dropped instead');
+  assert.equal(await store.peek('second'), undefined);
 });
