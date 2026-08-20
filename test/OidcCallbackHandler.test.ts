@@ -261,6 +261,51 @@ test('rejects a multi-audience token whose azp names another client', async () =
   );
 });
 
+// A single audience does not make azp advisory: a provider mints a token whose
+// aud names this client and whose azp names the requesting one whenever a
+// second client asks it for a token addressed here. That token is not ours.
+test('rejects a single-audience token whose azp names another client', async () => {
+  const handler = await exchangingHandler('s-azp-single-foreign');
+
+  await withTokenResponse(
+    { iss: 'https://idp.example', aud: 'pod-client', azp: 'rogue-client', webid: WEBID },
+    async () => {
+      await assert.rejects(
+        handler.login({ json: { state: 's-azp-single-foreign', code: 'c' }} as never),
+        (error: unknown): boolean => isBadRequest(error) && /authorized party/u.test(String(error)),
+      );
+    },
+  );
+});
+
+test('accepts a single-audience token whose azp names us', async () => {
+  const handler = await exchangingHandler('s-azp-single-ok');
+
+  await withTokenResponse(
+    { iss: 'https://idp.example', aud: 'pod-client', azp: 'pod-client', webid: WEBID },
+    async () => {
+      const { json } = await handler.login({ json: { state: 's-azp-single-ok', code: 'c' }} as never);
+      assert.equal(json.accountId, 'acc-1');
+    },
+  );
+});
+
+// The claim is a string in the spec; anything else has to be refused rather
+// than compared after a coercion that could make it match.
+test('rejects a token whose azp is not a string', async () => {
+  const handler = await exchangingHandler('s-azp-not-string');
+
+  await withTokenResponse(
+    { iss: 'https://idp.example', aud: 'pod-client', azp: ['pod-client'], webid: WEBID },
+    async () => {
+      await assert.rejects(
+        handler.login({ json: { state: 's-azp-not-string', code: 'c' }} as never),
+        (error: unknown): boolean => isBadRequest(error) && /authorized party/u.test(String(error)),
+      );
+    },
+  );
+});
+
 test('rejects an ID token that is not a JWT', async () => {
   const handler = await exchangingHandler('s-malformed');
 
@@ -315,12 +360,25 @@ const withProfile = async (
     return response;
   };
 
+  // Answering unconditionally would leave the redirect guard untested: a stub
+  // that hands back the 3xx no matter what is asked for cannot tell an
+  // implementation that refuses to follow redirects from one that follows them
+  // silently. So the stub follows, the way a real fetch would, and serves the
+  // document at the other end.
+  const followed = (): Response => new Response(profileTrusting('https://idp.example'), {
+    status: 200,
+    headers: { 'content-type': 'text/turtle' },
+  });
+
   const original = globalThis.fetch;
-  globalThis.fetch = (async (input: unknown) => {
+  globalThis.fetch = (async (input: unknown, init?: { redirect?: string }) => {
     if (String(input).includes('/token')) {
       return new Response(JSON.stringify({
         id_token: idToken({ iss: 'https://idp.example', aud: 'pod-client', webid: WEBID }),
       }), { status: 200 });
+    }
+    if (status >= 300 && status < 400 && init?.redirect !== 'manual') {
+      return followed();
     }
     return profileResponse();
   }) as unknown as typeof fetch;

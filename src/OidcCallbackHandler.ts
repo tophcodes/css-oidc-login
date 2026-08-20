@@ -156,10 +156,12 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
    * client registered at the same provider could mint a token this server
    * would accept.
    *
-   * A token naming several audiences additionally has to name this client as
-   * its authorized party (OIDC Core 3.1.3.7): membership in `aud` alone would
-   * let another client of the same provider mint a token for itself that also
-   * lists this one.
+   * OIDC Core 3.1.3.7 asks two separate things of `azp`, and both are needed
+   * here: a token that carries the claim at all has to name this client in it,
+   * and a token naming several audiences has to carry it. Membership in `aud`
+   * alone would let another client of the same provider mint a token for
+   * itself that also lists this one, and checking `azp` only for several
+   * audiences would let it mint one addressed solely to this client.
    */
   private assertIssuedForUs(claims: Record<string, unknown>): void {
     const expectedIssuer = this.args.issuer.replace(/\/*$/u, '');
@@ -178,7 +180,11 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
     if (!audience.includes(this.args.clientId)) {
       throw new BadRequestHttpError('ID token was issued for a different client.');
     }
-    if (audience.length > 1 && claims.azp !== this.args.clientId) {
+    const azpPresent = 'azp' in claims && claims.azp !== undefined;
+    if (azpPresent && claims.azp !== this.args.clientId) {
+      throw new BadRequestHttpError('ID token names another client as the authorized party.');
+    }
+    if (!azpPresent && audience.length > 1) {
       throw new BadRequestHttpError(
         'ID token names several audiences without naming this client as the authorized party.',
       );
