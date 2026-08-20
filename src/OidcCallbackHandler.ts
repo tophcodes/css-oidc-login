@@ -74,6 +74,23 @@ export interface OidcCallbackHandlerArgs {
 const providerFailed = (message: string): HttpError => new HttpError(502, 'BadGatewayHttpError', message);
 const providerTimedOut = (message: string): HttpError => new HttpError(504, 'GatewayTimeoutHttpError', message);
 
+/**
+ * The statuses RFC 6749 §5.2 uses for an answer that says something about the
+ * exchange: 400, or 401 for a client whose authentication the provider
+ * refused. Any other status is a provider failing rather than judging.
+ */
+const OAUTH_ERROR_STATUSES = new Set([ 400, 401 ]);
+
+/**
+ * The one error code of RFC 6749 §5.2 that is a verdict on what this caller
+ * brought: an authorization code that was already spent, has expired, was
+ * issued to somebody else, or does not match the verifier or the redirect URI
+ * of this exchange. Every other code names this server's own credentials,
+ * registration or request — `invalid_client` above all, which is what a wrong
+ * client secret comes back as, and which no browser can do anything about.
+ */
+const CALLER_ERROR_CODE = 'invalid_grant';
+
 /** Compares two secrets without leaking where they first differ. */
 const secretsMatch = (left: string, right: string): boolean => {
   const a = Buffer.from(left, 'utf8');
@@ -201,13 +218,10 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
       );
     }
     if (!response.ok) {
-      throw new BadRequestHttpError(`Token exchange failed with ${response.status}.`);
+      throw await this.describeExchangeRefusal(response);
     }
 
-    const body = this.parseTokenResponse(await readCapped(
-      response,
-      (): Error => providerFailed(`The token response is larger than ${RESPONSE_MAX_BYTES} bytes.`),
-    ));
+    const body = this.parseTokenResponse(await this.readTokenBody(response));
     if (!body.id_token) {
       throw new BadRequestHttpError('Token response carried no ID token.');
     }
@@ -222,6 +236,91 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
 
     this.assertIssuedForUs(claims);
     return claims;
+  }
+
+  /**
+   * Reads the token response, mapping a read that gives up part-way. The
+   * deadline covers the body as well as the headers, so a provider that
+   * answers and then trickles trips it here rather than at the fetch, and the
+   * exception that ends such a read is not an `HttpError` at all — left
+   * unmapped it reaches the client as an internal fault of this server for
+   * something that happened at the provider's end.
+   */
+  private async readTokenBody(response: Response): Promise<string> {
+    try {
+      return await readCapped(
+        response,
+        (): Error => providerFailed(`The token response is larger than ${RESPONSE_MAX_BYTES} bytes.`),
+      );
+    } catch (error) {
+      if (HttpError.isInstance(error)) {
+        throw error;
+      }
+      const name = (error as { name?: string }).name;
+      if (name === 'TimeoutError' || name === 'AbortError') {
+        throw providerTimedOut(`The token endpoint did not answer within ${RESPONSE_TIMEOUT_MS}ms.`);
+      }
+      throw providerFailed('The token response could not be read.');
+    }
+  }
+
+  /**
+   * Turns a refusal by the token endpoint into what the client is told.
+   *
+   * RFC 6749 §5.2 gives a provider one way of saying something about the
+   * exchange: a 400 — or a 401 for a client it would not authenticate —
+   * carrying a JSON object whose `error` member names what was wrong. Only
+   * that answer is read as a verdict at all, and of the codes it may carry
+   * only {@link CALLER_ERROR_CODE} is a verdict on the caller.
+   *
+   * A 400 or 401 without a well-formed error body is treated as the
+   * provider's failure too. Such an answer carries the status the protocol
+   * attaches meaning to but not the statement that gives it that meaning, so
+   * there is nothing in it that says this caller's code was bad; reading it as
+   * one would blame the person logging in for a provider that did not answer
+   * in the protocol's terms — the same mistake as blaming them for a 500. The
+   * cost is that a provider which refuses a spent code without an error body
+   * has its refusals reported as its own; the alternative cost is a person
+   * being told their login attempt was malformed when this server's client
+   * secret is wrong, which they cannot act on and nobody else gets to see.
+   */
+  private async describeExchangeRefusal(response: Response): Promise<HttpError> {
+    const { status } = response;
+    const code = await this.readOauthErrorCode(response);
+    if (code === CALLER_ERROR_CODE && OAUTH_ERROR_STATUSES.has(status)) {
+      return new BadRequestHttpError(`Token exchange failed with ${status} (${code}).`);
+    }
+    return providerFailed(
+      `The token endpoint refused the exchange with ${status}${code ? ` (${code})` : ''}.`,
+    );
+  }
+
+  /**
+   * The `error` member of an RFC 6749 §5.2 error response, if the answer
+   * carries one. A body that does not arrive, does not stop arriving, or is
+   * not a JSON object naming a code is an answer that states nothing, which is
+   * the same to the caller as no body at all — so nothing raised here is
+   * reported anywhere.
+   */
+  private async readOauthErrorCode(response: Response): Promise<string | undefined> {
+    let body: string;
+    try {
+      body = await readCapped(response, (): Error => new Error('The error body does not end.'));
+    } catch {
+      return undefined;
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      return undefined;
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      return undefined;
+    }
+    const { error } = parsed as { error?: unknown };
+    return typeof error === 'string' && error.length > 0 ? error : undefined;
   }
 
   private parseTokenResponse(body: string): { id_token?: string } {

@@ -1,7 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { OidcDiscovery } from '../src/OidcDiscovery.ts';
-import { BEYOND_PATIENCE_MS, DEADLINE_BOUND_MS, endlessBody, neverAnswers } from './bounds.ts';
+import {
+  BEYOND_PATIENCE_MS, DEADLINE_BOUND_MS, endlessBody, neverAnswers, stallsMidBody,
+} from './bounds.ts';
 
 const withFetch = async (impl: typeof fetch, fn: () => Promise<void>): Promise<void> => {
   const original = globalThis.fetch;
@@ -176,5 +178,22 @@ test('reports an issuer that does not answer as a timeout of its own', async () 
   await withFetch(impl, async () => {
     const discovery = new OidcDiscovery('https://idp.example');
     await assert.rejects(discovery.endpoints(), (error: unknown): boolean => statusOf(error) === 504);
+  });
+});
+
+// The deadline covers the document, not merely the headers that announce it.
+// An issuer that answers and then stops holds a worker just as long as one that
+// never answers, and what ends that read is not an error of this server's own —
+// left unmapped it would be reported as an internal fault of this server.
+test('gives up on an issuer that stops mid-document', { timeout: BEYOND_PATIENCE_MS }, async () => {
+  const impl = (async (_input: unknown, init?: { signal?: AbortSignal }) =>
+    stallsMidBody('application/json', init)) as unknown as typeof fetch;
+
+  await withFetch(impl, async () => {
+    const discovery = new OidcDiscovery('https://idp.example');
+    await assert.rejects(
+      discovery.endpoints(),
+      (error: unknown): boolean => statusOf(error) === 504 && /did not answer within/u.test(String(error)),
+    );
   });
 });

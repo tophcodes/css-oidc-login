@@ -56,10 +56,7 @@ export class OidcDiscovery {
       throw providerFailed(`Discovery for ${this.issuer} failed with ${response.status}.`);
     }
 
-    const document = this.parse(await readCapped(
-      response,
-      (): Error => providerFailed(`Discovery for ${this.issuer} is larger than ${RESPONSE_MAX_BYTES} bytes.`),
-    ));
+    const document = this.parse(await this.read(response));
     const issuer = document.issuer;
     const authorization = document.authorization_endpoint;
     const token = document.token_endpoint;
@@ -80,6 +77,31 @@ export class OidcDiscovery {
 
     this.cached = { authorization, token };
     return this.cached;
+  }
+
+  /**
+   * Reads the document, mapping a read that gives up part-way. The deadline
+   * covers the body as well as the headers, so an issuer that answers and then
+   * trickles trips it here rather than at the fetch, and what ends such a read
+   * is not an `HttpError` — left unmapped it would be reported as an internal
+   * fault of this server for a wait on somebody else's host.
+   */
+  private async read(response: Response): Promise<string> {
+    try {
+      return await readCapped(
+        response,
+        (): Error => providerFailed(`Discovery for ${this.issuer} is larger than ${RESPONSE_MAX_BYTES} bytes.`),
+      );
+    } catch (error) {
+      if (HttpError.isInstance(error)) {
+        throw error;
+      }
+      const name = (error as { name?: string }).name;
+      if (name === 'TimeoutError' || name === 'AbortError') {
+        throw providerTimedOut(`Discovery for ${this.issuer} did not answer within ${RESPONSE_TIMEOUT_MS}ms.`);
+      }
+      throw providerFailed(`Discovery for ${this.issuer} could not be read.`);
+    }
   }
 
   private parse(body: string): Record<string, unknown> {

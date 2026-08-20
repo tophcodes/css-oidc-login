@@ -6,7 +6,9 @@ import {
   OidcCallbackHandler, GRANT_ISSUER_PREDICATE, GRANT_SUBJECT_PREDICATE,
 } from '../src/OidcCallbackHandler.ts';
 import { PendingLoginStore } from '../src/PendingLoginStore.ts';
-import { BEYOND_PATIENCE_MS, DEADLINE_BOUND_MS, endlessBody, neverAnswers } from './bounds.ts';
+import {
+  BEYOND_PATIENCE_MS, DEADLINE_BOUND_MS, endlessBody, neverAnswers, stallsMidBody,
+} from './bounds.ts';
 
 /** Predicates are read off a store instance, the way the handlers read them. */
 const { cookiePredicate, setCookiePredicate } = new PendingLoginStore();
@@ -884,6 +886,103 @@ test('still blames the caller for what the token endpoint says about their code'
     await assert.rejects(
       handler.login(callback({ state: 's-token-rejected', code: 'c' })),
       (error: unknown): boolean => isBadRequest(error) && /failed with 400/u.test(String(error)),
+    );
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+/** Runs one exchange against a token endpoint that refuses it, and reports how. */
+const refusedExchange = async (
+  state: string,
+  status: number,
+  body: string | null,
+): Promise<{ status?: number; message: string }> => {
+  const handler = await exchangingHandler(state);
+
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(body, { status })) as unknown as typeof fetch;
+  try {
+    await handler.login(callback({ state, code: 'c' }));
+    throw new Error(`the exchange was not refused at all for ${status}`);
+  } catch (error) {
+    return { status: statusOf(error), message: String(error) };
+  } finally {
+    globalThis.fetch = original;
+  }
+};
+
+/**
+ * The measured mapping, one row per answer a token endpoint can refuse with.
+ * RFC 6749 §5.2 makes only a 400 or a 401 carrying a JSON object with an
+ * `error` member a statement about the exchange at all, and of the codes such
+ * a statement can carry only `invalid_grant` is about what this caller
+ * brought. `invalid_client` is the client secret of this server being wrong,
+ * which the person logging in cannot act on and would never see reported as
+ * the provider's if it arrived as a bad request.
+ */
+const EXCHANGE_REFUSALS: { status: number; body: string | null; expected: number; why: string }[] = [
+  { status: 400, body: '{"error":"invalid_grant"}', expected: 400, why: 'the code this caller brought' },
+  { status: 401, body: '{"error":"invalid_grant"}', expected: 400, why: 'the code this caller brought' },
+  { status: 400, body: '{"error":"invalid_client"}', expected: 502, why: 'this server\'s own credentials' },
+  { status: 401, body: '{"error":"invalid_client"}', expected: 502, why: 'this server\'s own credentials' },
+  { status: 400, body: '{"error":"invalid_scope"}', expected: 502, why: 'this server\'s own request' },
+  { status: 400, body: null, expected: 502, why: 'a status without a statement' },
+  { status: 401, body: null, expected: 502, why: 'a status without a statement' },
+  { status: 400, body: '<html>no</html>', expected: 502, why: 'a status without a statement' },
+  { status: 400, body: '{"error":42}', expected: 502, why: 'a status without a statement' },
+  { status: 429, body: '{"error":"invalid_grant"}', expected: 502, why: 'a provider refusing to answer now' },
+  { status: 429, body: null, expected: 502, why: 'a provider refusing to answer now' },
+  { status: 500, body: '{"error":"invalid_grant"}', expected: 502, why: 'a provider that failed' },
+  { status: 500, body: null, expected: 502, why: 'a provider that failed' },
+  { status: 503, body: '{"error":"invalid_grant"}', expected: 502, why: 'a provider that is not there' },
+  { status: 503, body: null, expected: 502, why: 'a provider that is not there' },
+];
+
+test('reports every refusal of the token endpoint as whose failure it is', async () => {
+  for (const [ index, row ] of EXCHANGE_REFUSALS.entries()) {
+    const { status, message } = await refusedExchange(`s-refusal-${index}`, row.status, row.body);
+    assert.equal(
+      status,
+      row.expected,
+      `${row.status} with ${row.body ?? 'no body'} was reported as ${status}, not as ${row.expected} ` +
+      `(${row.why}) — the message was: ${message}`,
+    );
+  }
+});
+
+// The one this matters most for. A wrong client secret is a deployment that
+// was never finished, and the person at the browser has no part in it and
+// nothing to do about it; told as their bad request it is also the failure an
+// operator is least likely to find, because it arrives among every genuinely
+// bad callback the route refuses all day.
+test('does not report this server\'s own credentials as the caller\'s mistake', async () => {
+  const { status, message } = await refusedExchange(
+    's-token-client-secret',
+    401,
+    '{"error":"invalid_client","error_description":"client authentication failed"}',
+  );
+
+  assert.equal(status, 502, `a refused client secret was reported to the caller as ${status}`);
+  assert.match(message, /refused the exchange with 401 \(invalid_client\)/u);
+});
+
+// The deadline has to cover the answer, not just its first byte. A provider
+// that sends headers and then stops holds a worker exactly as long as one that
+// never answers at all, and the exception that ends the read is not one of this
+// server's own — unmapped it surfaces as an internal fault for something that
+// happened at the provider's end.
+test('gives up on a token endpoint that stops mid-answer', { timeout: BEYOND_PATIENCE_MS }, async () => {
+  const handler = await exchangingHandler('s-token-stalls');
+
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (_input: unknown, init?: { signal?: AbortSignal }) =>
+    stallsMidBody('application/json', init)) as unknown as typeof fetch;
+
+  try {
+    await assert.rejects(
+      handler.login(callback({ state: 's-token-stalls', code: 'c' })),
+      (error: unknown): boolean => statusOf(error) === 504 && /did not answer within/u.test(String(error)),
     );
   } finally {
     globalThis.fetch = original;

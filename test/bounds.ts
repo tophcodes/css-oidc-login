@@ -65,3 +65,38 @@ export const endlessBody = (contentType: string): Response => {
   });
   return new Response(body, { status: 200, headers: { 'content-type': contentType }});
 };
+
+/**
+ * A host that answers and then stops: the headers arrive, the body begins, and
+ * the rest never comes. A real fetch ends such a read by erroring the body
+ * stream with the request's own deadline, which is a failure that reaches the
+ * reader rather than the call that made the request — so an implementation
+ * that maps a deadline only around `fetch` never sees it, and lets it out as
+ * whatever the runtime raised.
+ */
+export const stallsMidBody = (contentType: string, init?: { signal?: AbortSignal }): Response => {
+  const { signal } = init ?? {};
+  assert.ok(signal instanceof AbortSignal, 'the request carries no abort signal');
+
+  const body = new ReadableStream({
+    start(controller): void {
+      controller.enqueue(new TextEncoder().encode('{'));
+    },
+    async pull(controller): Promise<void> {
+      let patience: ReturnType<typeof setTimeout>;
+      const stillWaiting = await new Promise<boolean>((resolve): void => {
+        patience = setTimeout((): void => resolve(true), DEADLINE_BOUND_MS);
+        if (signal.aborted) {
+          resolve(false);
+          return;
+        }
+        signal.addEventListener('abort', (): void => resolve(false), { once: true });
+      });
+      clearTimeout(patience!);
+
+      assert.equal(stillWaiting, false, `the body was still being read after ${DEADLINE_BOUND_MS}ms`);
+      controller.error(signal.reason);
+    },
+  });
+  return new Response(body, { status: 200, headers: { 'content-type': contentType }});
+};
