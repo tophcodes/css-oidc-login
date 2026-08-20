@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { DataFactory } from 'n3';
 import { OidcRedirectHandler } from '../src/OidcRedirectHandler.ts';
+import { OidcDiscovery } from '../src/OidcDiscovery.ts';
 import { PendingLoginStore } from '../src/PendingLoginStore.ts';
 
 const { setCookiePredicate } = new PendingLoginStore();
@@ -217,4 +218,43 @@ test('starts a login on a POST and on nothing else', async () => {
 
   await handler.handle(input);
   assert.equal(created.length, 1, 'a POST did not start a login');
+});
+
+// `location` is read by the start template as `location.href = body.location`,
+// so whatever reaches it is navigated to. A discovery document naming
+// `javascript:...` as its authorization endpoint would put script on this
+// server's own origin there; it has to be stopped before a login is even
+// started, and the refusal is the provider's failure, not the caller's.
+test('never hands the browser an authorization endpoint that is not https', async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    issuer: 'https://idp.example',
+    authorization_endpoint: 'javascript:alert(document.domain)//',
+    token_endpoint: 'https://idp.example/token',
+  }), { status: 200 })) as unknown as typeof fetch;
+
+  try {
+    const store = new PendingLoginStore();
+    const handler = new OidcRedirectHandler({
+      store,
+      discovery: new OidcDiscovery('https://idp.example'),
+      clientId: 'pod-client',
+      callbackUrl: 'https://pod.example/.account/login/oidc/callback/',
+    });
+
+    let result: { json: { location?: unknown }} | undefined;
+    await assert.rejects(
+      (async (): Promise<void> => {
+        result = await handler.handle(input) as never;
+      })(),
+      (error: unknown): boolean => {
+        assert.equal((error as { statusCode?: number }).statusCode, 502);
+        assert.match(String(error), /authorization_endpoint that is not an absolute HTTPS URL/u);
+        return true;
+      },
+    );
+    assert.equal(result, undefined, 'a javascript: endpoint reached the browser as json.location');
+  } finally {
+    globalThis.fetch = original;
+  }
 });

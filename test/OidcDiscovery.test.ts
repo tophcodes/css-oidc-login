@@ -212,7 +212,7 @@ test('refuses a document whose endpoints are not URLs', async () => {
       const discovery = new OidcDiscovery('https://idp.example');
       await assert.rejects(discovery.endpoints(), (error: unknown): boolean => {
         assert.equal(statusOf(error), 502, `a ${endpoint} that is no URL was reported as ${statusOf(error)}`);
-        assert.match(String(error), new RegExp(`${endpoint} that is not an absolute URL`, 'u'));
+        assert.match(String(error), new RegExp(`${endpoint} that is not an absolute HTTPS URL`, 'u'));
         return true;
       });
     });
@@ -229,8 +229,60 @@ test('reports a configured issuer that is no URL as this server\'s own', async (
     const discovery = new OidcDiscovery('not an issuer');
     await assert.rejects(discovery.endpoints(), (error: unknown): boolean => {
       assert.equal(statusOf(error), 500, `a configured issuer that is no URL was reported as ${statusOf(error)}`);
-      assert.match(String(error), /configured issuer not an issuer is not an absolute URL/u);
+      assert.match(String(error), /configured issuer not an issuer is not an absolute HTTPS URL/u);
       return true;
     });
   });
+});
+
+// The authorization endpoint leaves this package as the address a browser is
+// told to navigate to. A scheme other than `https:` parses as a URL just as
+// well, and `javascript:` there is script running on this server's own origin
+// — written by the one party every check in this package exists to distrust.
+// `urn:` is refused with them: it parses, but nothing can be resolved against
+// it.
+test('refuses an endpoint whose scheme is not https', async () => {
+  const dangerous = [
+    'javascript:alert(document.domain)//',
+    'data:text/html,<script>alert(1)</script>',
+    'file:///etc/passwd',
+    'urn:example:authorize',
+    'http://idp.example/authorize',
+  ];
+
+  for (const endpoint of [ 'authorization_endpoint', 'token_endpoint' ]) {
+    for (const value of dangerous) {
+      const impl = (async () =>
+        new Response(document({ [endpoint]: value }), { status: 200 })
+      ) as unknown as typeof fetch;
+
+      await withFetch(impl, async () => {
+        const discovery = new OidcDiscovery('https://idp.example');
+        await assert.rejects(discovery.endpoints(), (error: unknown): boolean => {
+          assert.equal(statusOf(error), 502, `a ${endpoint} of ${value} was reported as ${statusOf(error)}`);
+          assert.match(String(error), new RegExp(`${endpoint} that is not an absolute HTTPS URL`, 'u'));
+          return true;
+        });
+      });
+    }
+  }
+});
+
+// The guard on the configured issuer has to test what the line below it needs,
+// not merely that the value parses. An opaque-path scheme parses and then
+// cannot be resolved against, so a guard that only parses hands the failure on
+// as an unclassified fault that names neither the setting nor its value.
+test('reports a configured issuer this server cannot resolve against as its own', async () => {
+  const impl = (async () => new Response(document(), { status: 200 })) as unknown as typeof fetch;
+
+  for (const issuer of [ 'urn:example:idp', 'mailto:idp@example', 'http://idp.example' ]) {
+    await withFetch(impl, async () => {
+      const discovery = new OidcDiscovery(issuer);
+      await assert.rejects(discovery.endpoints(), (error: unknown): boolean => {
+        assert.equal(statusOf(error), 500, `a configured issuer of ${issuer} was reported as ${statusOf(error)}`);
+        assert.match(String(error), new RegExp(`configured issuer ${issuer} is not an absolute HTTPS URL`, 'u'));
+        return true;
+      });
+    });
+  }
 });

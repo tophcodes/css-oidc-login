@@ -21,15 +21,30 @@ const providerTimedOut = (message: string): HttpError => new HttpError(504, 'Gat
 const withoutTrailingSlashes = (iri: string): string => iri.replace(/\/*$/u, '');
 
 /**
- * Whether a value can be used as a URL at all. Both endpoints the document
- * names end up in a `fetch` and one of them in a `new URL`, and a string that
- * is neither is a document this server cannot act on however well-formed the
- * JSON around it was.
+ * Whether a value is a URL this server may act on: an absolute `https:` one.
+ *
+ * `new URL` merely parsing is not enough on either side of this.
+ *
+ * It is too permissive for what the values are used for. `javascript:`,
+ * `data:` and `file:` all parse, and the authorization endpoint is handed to a
+ * browser as the address to navigate to — a document naming
+ * `javascript:...` would run as script on this server's own origin, granted by
+ * the one party this package's grant model exists to distrust.
+ *
+ * It is also too weak for what the issuer is put through: for an opaque-path
+ * scheme such as `urn:` or `mailto:` the value parses but resolving a relative
+ * path against it does not, so a check that only parses passes a value the
+ * next line throws on.
+ *
+ * Plain `http:` is refused with the rest. The pending-login cookie already
+ * requires this server to be served over HTTPS, and a token exchange over
+ * `http:` would put the client secret on the wire in clear — a provider
+ * reachable only over plain HTTP cannot be used safely from here, so it is
+ * named rather than quietly accepted.
  */
-const isAbsoluteUrl = (value: string): boolean => {
+const isHttpsUrl = (value: string): boolean => {
   try {
-    void new URL(value);
-    return true;
+    return new URL(value).protocol === 'https:';
   } catch {
     return false;
   }
@@ -48,13 +63,15 @@ export class OidcDiscovery {
       return this.cached;
     }
 
-    // The issuer is configuration, so an issuer that is no URL is this
+    // The issuer is configuration, so an issuer this server cannot use is this
     // deployment's own failure and nobody else's — said so here rather than
     // left to surface as whatever `new URL` raises, which is an unclassified
-    // fault of this server that names neither the setting nor its value.
-    if (!isAbsoluteUrl(`${withoutTrailingSlashes(this.issuer)}/`)) {
+    // fault of this server that names neither the setting nor its value. The
+    // check is on the same base string the next line resolves against, so it
+    // tests exactly what that resolution needs.
+    if (!isHttpsUrl(`${withoutTrailingSlashes(this.issuer)}/`)) {
       throw new InternalServerError(
-        `The configured issuer ${this.issuer} is not an absolute URL, so this server cannot look up ` +
+        `The configured issuer ${this.issuer} is not an absolute HTTPS URL, so this server cannot look up ` +
         'the discovery document that every later check hangs off.',
       );
     }
@@ -99,18 +116,18 @@ export class OidcDiscovery {
     if (typeof token !== 'string') {
       throw providerFailed(`Discovery for ${this.issuer} carried no token_endpoint.`);
     }
-    // An endpoint that is a string but no URL is a document that cannot be
-    // acted on. Left to the caller, the authorization one surfaces as whatever
-    // `new URL` raises where the login is built — an unclassified fault of
-    // this server for a document the provider wrote.
-    if (!isAbsoluteUrl(authorization)) {
+    // An endpoint outside this is a document that cannot be acted on, and the
+    // authorization one is not merely unusable but dangerous: it leaves here as
+    // the address a browser is told to go to, so a scheme other than `https:`
+    // is refused before it can become one.
+    if (!isHttpsUrl(authorization)) {
       throw providerFailed(
-        `Discovery for ${this.issuer} names an authorization_endpoint that is not an absolute URL.`,
+        `Discovery for ${this.issuer} names an authorization_endpoint that is not an absolute HTTPS URL.`,
       );
     }
-    if (!isAbsoluteUrl(token)) {
+    if (!isHttpsUrl(token)) {
       throw providerFailed(
-        `Discovery for ${this.issuer} names a token_endpoint that is not an absolute URL.`,
+        `Discovery for ${this.issuer} names a token_endpoint that is not an absolute HTTPS URL.`,
       );
     }
 
