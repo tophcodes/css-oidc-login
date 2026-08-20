@@ -34,6 +34,12 @@ const HOST_PREFIX = '__Host-';
  * because that writer fixes `SameSite=Lax`, and `Strict` is the property this
  * cookie exists for.
  *
+ * The map is bounded. Nothing authenticates the route that fills it, so the
+ * number of logins in progress is whatever anyone cares to ask for, and an
+ * entry that is never redeemed is otherwise only noticed when somebody asks
+ * for that exact state again — which an abandoned one never is. See
+ * {@link reclaim}.
+ *
  * One browser can carry one login in progress. A second login started in the
  * same browser overwrites the first one's cookie, after which the first can no
  * longer be completed — it is left to expire rather than being spent. Holding
@@ -46,6 +52,14 @@ export class PendingLoginStore {
 
   /** How long a login in progress stays redeemable; also the cookie's lifetime. */
   public readonly ttlMs: number;
+
+  /**
+   * The most logins that may be in progress at once. Reached only by someone
+   * asking for more than a server's worth of logins within one TTL, and past
+   * it the oldest are dropped rather than the process growing without end.
+   */
+  public readonly maxPending: number;
+
   /**
    * Name of the cookie holding the handle, always carrying the `__Host-`
    * prefix. It is both the name written and the name a deployment maps in the
@@ -65,13 +79,36 @@ export class PendingLoginStore {
    */
   public readonly setCookiePredicate = 'urn:css-oidc-login:http:setPendingLoginCookie';
 
-  public constructor(ttlMs = 600000, cookieName = 'css-oidc-login-pending') {
+  public constructor(ttlMs = 600000, cookieName = 'css-oidc-login-pending', maxPending = 10000) {
     this.ttlMs = ttlMs;
     this.cookieName = cookieName.startsWith(HOST_PREFIX) ? cookieName : `${HOST_PREFIX}${cookieName}`;
+    this.maxPending = maxPending;
   }
 
   public async create(state: string, data: PendingLogin): Promise<void> {
+    this.reclaim();
     this.pending.set(state, { data, expires: Date.now() + this.ttlMs });
+  }
+
+  /**
+   * Makes room for one more login, on the only occasion the store is otherwise
+   * touched at all. Every entry gets the same lifetime, so a map that keeps
+   * insertion order holds them in the order they expire: the front is what
+   * expires first, and walking it stops at the first entry that is neither
+   * expired nor over the cap, which is the usual case and costs nothing.
+   *
+   * Expiry is what does the reclaiming; the cap only bites once nothing in the
+   * store has expired yet, and then it drops the login closest to expiring —
+   * never one with more time left than another.
+   */
+  private reclaim(): void {
+    const now = Date.now();
+    for (const [state, entry] of this.pending) {
+      if (entry.expires >= now && this.pending.size < this.maxPending) {
+        return;
+      }
+      this.pending.delete(state);
+    }
   }
 
   /**
