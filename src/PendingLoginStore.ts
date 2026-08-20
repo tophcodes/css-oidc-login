@@ -1,4 +1,15 @@
-import { InternalServerError } from '@solid/community-server';
+import { HttpError, InternalServerError } from '@solid/community-server';
+
+/**
+ * A store with no room left is a server that is momentarily out of a resource,
+ * not a caller who asked for something wrong: the request that meets a full
+ * store is the same request that would have been accepted a moment earlier and
+ * will be again once the logins in progress finish or expire. So it is refused
+ * as a condition of this server that passes, with the status that says exactly
+ * that.
+ */
+const outOfRoom = (message: string): HttpError =>
+  new HttpError(503, 'ServiceUnavailableHttpError', message);
 
 export interface PendingLogin {
   codeVerifier: string;
@@ -40,6 +51,13 @@ const HOST_PREFIX = '__Host-';
  * for that exact state again — which an abandoned one never is. See
  * {@link reclaim}.
  *
+ * A bound that is reached has to be paid for by somebody, and the one thing it
+ * may not cost is a login that is already in progress: whoever fills the store
+ * is unauthenticated, so evicting to make room hands that same unauthenticated
+ * party the power to throw a user out of their login — the very thing the
+ * bound was added to prevent being possible at all. So a full store refuses
+ * the new login instead. See {@link create}.
+ *
  * One browser can carry one login in progress. A second login started in the
  * same browser overwrites the first one's cookie, after which the first can no
  * longer be completed — it is left to expire rather than being spent. Holding
@@ -56,7 +74,7 @@ export class PendingLoginStore {
   /**
    * The most logins that may be in progress at once. Reached only by someone
    * asking for more than a server's worth of logins within one TTL, and past
-   * it the oldest are dropped rather than the process growing without end.
+   * it further logins are refused rather than the process growing without end.
    */
   public readonly maxPending: number;
 
@@ -85,26 +103,45 @@ export class PendingLoginStore {
     this.maxPending = maxPending;
   }
 
+  /**
+   * Takes a login into the store, or refuses it because there is no room.
+   *
+   * Expired logins are what makes room. Once none are left, the login being
+   * started is the one that gives way, because it is the only one that has
+   * nothing to lose: it has not left for the provider yet, and the person
+   * starting it learns immediately that they should try again. Every other
+   * choice spends somebody else's login in progress on it — an eviction of any
+   * kind, however it picks its victim, lets whoever fills the store decide who
+   * gets thrown out, and filling it takes nothing but unauthenticated
+   * requests. What this costs is that a store held full stops new logins from
+   * starting; what it buys is that no login that has already begun can be
+   * taken away by anyone but its owner.
+   */
   public async create(state: string, data: PendingLogin): Promise<void> {
     this.reclaim();
+    if (this.pending.size >= this.maxPending) {
+      throw outOfRoom(
+        `This server is holding ${this.maxPending} logins in progress and cannot take another one. ` +
+        'Try again in a few minutes.',
+      );
+    }
     this.pending.set(state, { data, expires: Date.now() + this.ttlMs });
   }
 
   /**
-   * Makes room for one more login, on the only occasion the store is otherwise
-   * touched at all. Every entry gets the same lifetime, so a map that keeps
-   * insertion order holds them in the order they expire: the front is what
-   * expires first, and walking it stops at the first entry that is neither
-   * expired nor over the cap, which is the usual case and costs nothing.
+   * Drops the logins that have expired, on the only occasion the store is
+   * otherwise touched at all. Every entry gets the same lifetime, so a map
+   * that keeps insertion order holds them in the order they expire: the front
+   * is what expires first, and walking it stops at the first entry that is
+   * still live, which is the usual case and costs nothing.
    *
-   * Expiry is what does the reclaiming; the cap only bites once nothing in the
-   * store has expired yet, and then it drops the login closest to expiring —
-   * never one with more time left than another.
+   * Expiry is the only thing that takes an entry out from under its owner, and
+   * an expired login is one nobody can complete any more.
    */
   private reclaim(): void {
     const now = Date.now();
     for (const [state, entry] of this.pending) {
-      if (entry.expires >= now && this.pending.size < this.maxPending) {
+      if (entry.expires >= now) {
         return;
       }
       this.pending.delete(state);

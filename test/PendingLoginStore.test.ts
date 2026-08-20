@@ -61,15 +61,20 @@ test('refuses to serialise a cookie for a callback that is not HTTPS', async () 
 // The route that fills this map is unauthenticated and an abandoned entry is
 // never asked for again, so nothing else ever takes one out. What is asserted
 // here is the bound itself: however many logins are started, the map holds no
-// more than its cap, and what it holds is the most recent ones rather than
-// whatever it happened to accept first.
+// more than its cap, and it is the ones that arrive past the cap that are
+// turned away rather than the ones already in it.
 test('holds no more logins than its cap, however many are started', async () => {
   const cap = 10;
   const started = 100;
   const store = new PendingLoginStore(600000, 'pending', cap);
+  let refused = 0;
 
   for (let i = 0; i < started; i++) {
-    await store.create(`state-${i}`, { codeVerifier: 'v', handle: 'h' });
+    try {
+      await store.create(`state-${i}`, { codeVerifier: 'v', handle: 'h' });
+    } catch {
+      refused += 1;
+    }
   }
 
   const held: number[] = [];
@@ -80,7 +85,54 @@ test('holds no more logins than its cap, however many are started', async () => 
   }
 
   assert.equal(held.length, cap, `the store holds ${held.length} logins in progress, not ${cap}`);
-  assert.deepEqual(held, [90, 91, 92, 93, 94, 95, 96, 97, 98, 99]);
+  assert.deepEqual(held, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+  assert.equal(refused, started - cap);
+});
+
+// The caller of a full store did nothing wrong and the condition passes on its
+// own, so it is answered as a server that is momentarily out of room rather
+// than as a bad request or a fault.
+test('refuses a login it has no room for as a temporary condition of this server', async () => {
+  const store = new PendingLoginStore(600000, 'pending', 1);
+  await store.create('the-one-it-holds', { codeVerifier: 'v', handle: 'h' });
+
+  await assert.rejects(
+    store.create('one-too-many', { codeVerifier: 'v', handle: 'h' }),
+    (error: unknown): boolean => (error as { statusCode?: number }).statusCode === 503,
+  );
+});
+
+// The bound is only worth having if it cannot be turned around: filling the
+// store is unauthenticated and costs nothing, so a store that made room by
+// dropping an entry would hand a flooder the power to end anyone's login while
+// they are still at the provider. Every entry the flood writes is live, so
+// expiry reclaims none of them and it is the eviction rule alone that decides
+// who loses. Whatever it drops here, it may not be the victim.
+test('does not let a flood take away a login that is already in progress', async () => {
+  const cap = 1000;
+  const store = new PendingLoginStore(600000, 'pending', cap);
+
+  // The victim is inside their TTL and away at the provider, holding the
+  // handle their browser was given.
+  await store.create('victim', { codeVerifier: 'victim-verifier', handle: 'victim-handle' });
+
+  // Ten times the store's worth of unauthenticated starts, none of them ever
+  // returning from a provider.
+  let refused = 0;
+  for (let i = 0; i < cap * 10; i++) {
+    try {
+      await store.create(`flood-${i}`, { codeVerifier: 'v', handle: 'h' });
+    } catch {
+      refused += 1;
+    }
+  }
+
+  assert.deepEqual(
+    await store.consume('victim'),
+    { codeVerifier: 'victim-verifier', handle: 'victim-handle' },
+    'the flood took away a login that was in progress',
+  );
+  assert.ok(refused > 0, 'the flood was never turned away, so the store is not bounded');
 });
 
 // Expiry is what reclaims, and the cap is only the backstop: a store whose
