@@ -91,6 +91,18 @@ const OAUTH_ERROR_STATUSES = new Set([ 400, 401 ]);
  */
 const CALLER_ERROR_CODE = 'invalid_grant';
 
+/**
+ * What an `error` has to look like to be read as a code at all: the charset
+ * RFC 6749 §A.7 fixes for it — visible ASCII without the double quote and the
+ * backslash — and a length no code the protocol defines comes near needing.
+ * The member is a string the provider chooses that ends up in a message handed
+ * back to whoever called and in a line this server logs, so a value outside
+ * this is refused rather than trimmed to fit: a trimmed code is a different
+ * code, and naming one the provider never sent is worse than naming none,
+ * which the refusal already reads as an answer that states nothing.
+ */
+const OAUTH_ERROR_CODE = /^[\u0021\u0023-\u005B\u005D-\u007E]{1,64}$/u;
+
 /** Compares two secrets without leaking where they first differ. */
 const secretsMatch = (left: string, right: string): boolean => {
   const a = Buffer.from(left, 'utf8');
@@ -222,8 +234,8 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
     }
 
     const body = this.parseTokenResponse(await this.readTokenBody(response));
-    if (!body.id_token) {
-      throw new BadRequestHttpError('Token response carried no ID token.');
+    if (typeof body.id_token !== 'string' || body.id_token.length === 0) {
+      throw providerFailed('The token response carried no ID token.');
     }
 
     // The signature is not re-verified, which OIDC Core 3.1.3.7 permits: the
@@ -297,16 +309,28 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
 
   /**
    * The `error` member of an RFC 6749 §5.2 error response, if the answer
-   * carries one. A body that does not arrive, does not stop arriving, or is
-   * not a JSON object naming a code is an answer that states nothing, which is
-   * the same to the caller as no body at all — so nothing raised here is
-   * reported anywhere.
+   * carries one. A body that does not arrive, that runs past the cap, or that
+   * is not a JSON object naming a code is an answer that states nothing, which
+   * is the same to the caller as no body at all — so none of that is reported
+   * as anything of its own.
+   *
+   * A read the deadline ends is the one thing here that is not merely a
+   * missing statement. A provider that refuses and then trickles holds a
+   * worker exactly as long as one that never answers, and that wait is what
+   * the deadline exists to end; swallowed here it would be reported as a
+   * refusal the provider never finished making, and the status that says
+   * "waited and got nothing" would be lost on the one path that can still
+   * reach it.
    */
   private async readOauthErrorCode(response: Response): Promise<string | undefined> {
     let body: string;
     try {
       body = await readCapped(response, (): Error => new Error('The error body does not end.'));
-    } catch {
+    } catch (error) {
+      const name = (error as { name?: string }).name;
+      if (name === 'TimeoutError' || name === 'AbortError') {
+        throw providerTimedOut(`The token endpoint did not answer within ${RESPONSE_TIMEOUT_MS}ms.`);
+      }
       return undefined;
     }
 
@@ -320,41 +344,52 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
       return undefined;
     }
     const { error } = parsed as { error?: unknown };
-    return typeof error === 'string' && error.length > 0 ? error : undefined;
+    return typeof error === 'string' && OAUTH_ERROR_CODE.test(error) ? error : undefined;
   }
 
-  private parseTokenResponse(body: string): { id_token?: string } {
+  /**
+   * Reads the answer of a token endpoint that said the exchange succeeded.
+   * Nothing in it is the caller's: the endpoint is the one discovery named,
+   * the request carried this server's own credentials, and what came back is
+   * the provider's own composition. So a body this server cannot make sense of
+   * is reported the same way a body that never arrives is — as the provider's
+   * failure, not as a verdict on the callback somebody brought.
+   */
+  private parseTokenResponse(body: string): { id_token?: unknown } {
     let parsed: unknown;
     try {
       parsed = JSON.parse(body);
     } catch {
-      throw new BadRequestHttpError('Token response is not valid JSON.');
+      throw providerFailed('The token response is not valid JSON.');
     }
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-      throw new BadRequestHttpError('Token response is not a JSON object.');
+      throw providerFailed('The token response is not a JSON object.');
     }
-    return parsed as { id_token?: string };
+    return parsed as { id_token?: unknown };
   }
 
   /**
-   * Reads the claim set out of a JWT without verifying its signature. Anything
-   * that is not a JWT carrying a JSON object payload is a bad callback, not a
-   * server fault, so it is refused the same way every other bad input is.
+   * Reads the claim set out of a JWT without verifying its signature. The
+   * token is what the provider put in its own answer, so a string that is not
+   * a JWT carrying a JSON object payload is that answer being unreadable
+   * rather than a bad callback: the caller brought a code, and what was minted
+   * for it was not theirs to compose. What the claims then say is checked
+   * separately.
    */
   private decodeClaims(idToken: string): Record<string, unknown> {
     const parts = idToken.split('.');
     if (parts.length !== 3 || parts[1].length === 0) {
-      throw new BadRequestHttpError('ID token is not a well-formed JWT.');
+      throw providerFailed('The ID token is not a well-formed JWT.');
     }
 
     let payload: unknown;
     try {
       payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
     } catch {
-      throw new BadRequestHttpError('ID token payload is not valid JSON.');
+      throw providerFailed('The ID token payload is not valid JSON.');
     }
     if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
-      throw new BadRequestHttpError('ID token payload is not a JSON object.');
+      throw providerFailed('The ID token payload is not a JSON object.');
     }
     return payload as Record<string, unknown>;
   }

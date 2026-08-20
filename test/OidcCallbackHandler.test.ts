@@ -461,26 +461,71 @@ test('rejects a token whose azp is not a string', async () => {
   );
 });
 
-test('rejects an ID token that is not a JWT', async () => {
-  const handler = await exchangingHandler('s-malformed');
+/** A JWT carrying `payload` verbatim, however little of a claim set it is. */
+const jwtCarrying = (payload: string): string =>
+  `header.${Buffer.from(payload).toString('base64url')}.signature`;
 
-  await withTokenBody({ id_token: 'not-a-jwt' }, async () => {
-    await assert.rejects(
-      handler.login(callback({ state: 's-malformed', code: 'c' })),
-      (error: unknown): boolean => isBadRequest(error) && /well-formed JWT/u.test(String(error)),
+/** Runs one exchange against a token endpoint that answers `body` with a 200. */
+const answeredExchange = async (state: string, body: string): Promise<{ status?: number; message: string }> => {
+  const handler = await exchangingHandler(state);
+
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(body, { status: 200 })) as unknown as typeof fetch;
+  try {
+    await handler.login(callback({ state, code: 'c' }));
+    throw new Error(`the answer was taken for a token: ${body}`);
+  } catch (error) {
+    return { status: statusOf(error), message: String(error) };
+  } finally {
+    globalThis.fetch = original;
+  }
+};
+
+/**
+ * The measured mapping, one row per answer a token endpoint can say the
+ * exchange succeeded with. A 200 is the provider saying it did, so everything
+ * in what follows is the provider's own composition: the caller brought a
+ * code, and what was minted for it was not theirs to write. An answer this
+ * server cannot make sense of is that provider answering in a way that is no
+ * answer at all — the same thing a body that never arrives is, and the same
+ * thing an unreadable refusal is, so it is reported as the same failure.
+ *
+ * Reported as the caller's instead, an operator who configures scopes without
+ * `openid`, or registers a client the provider issues no ID token for, sees
+ * every login die as somebody's bad request, among all the callbacks that
+ * genuinely are one — which is the one failure they could have acted on.
+ */
+const UNREADABLE_TOKEN_ANSWERS: { body: string; says: RegExp; why: string }[] = [
+  { body: '<html>oops</html>', says: /not valid JSON/u, why: 'an answer that is not JSON' },
+  { body: '[]', says: /not a JSON object/u, why: 'an answer that is not an object' },
+  { body: '{"access_token":"a"}', says: /carried no ID token/u, why: 'an answer with no ID token in it' },
+  { body: '{"id_token":""}', says: /carried no ID token/u, why: 'an empty ID token' },
+  { body: '{"id_token":5}', says: /carried no ID token/u, why: 'an ID token that is not a string' },
+  { body: '{"id_token":{}}', says: /carried no ID token/u, why: 'an ID token that is not a string' },
+  { body: '{"id_token":"garbage"}', says: /not a well-formed JWT/u, why: 'an ID token that is not a JWT' },
+  { body: '{"id_token":"header..signature"}', says: /not a well-formed JWT/u, why: 'a JWT with no payload' },
+  {
+    body: JSON.stringify({ id_token: jwtCarrying('not json') }),
+    says: /payload is not valid JSON/u,
+    why: 'a payload that is not JSON',
+  },
+  {
+    body: JSON.stringify({ id_token: jwtCarrying('[]') }),
+    says: /payload is not a JSON object/u,
+    why: 'a payload that is not an object',
+  },
+];
+
+test('reports an answer it cannot make sense of as the provider\'s failure', async () => {
+  for (const [ index, row ] of UNREADABLE_TOKEN_ANSWERS.entries()) {
+    const { status, message } = await answeredExchange(`s-unreadable-${index}`, row.body);
+    assert.equal(
+      status,
+      502,
+      `${row.why} was reported as ${status}, not as 502 — the message was: ${message}`,
     );
-  });
-});
-
-test('rejects an ID token whose payload is not JSON', async () => {
-  const handler = await exchangingHandler('s-garbage');
-
-  await withTokenBody({ id_token: `header.${Buffer.from('not json').toString('base64url')}.signature` }, async () => {
-    await assert.rejects(
-      handler.login(callback({ state: 's-garbage', code: 'c' })),
-      (error: unknown): boolean => isBadRequest(error) && /not valid JSON/u.test(String(error)),
-    );
-  });
+    assert.match(message, row.says);
+  }
 });
 
 // A 307 or 308 replays the POST body at the redirect target, handing the client
@@ -965,6 +1010,62 @@ test('does not report this server\'s own credentials as the caller\'s mistake', 
 
   assert.equal(status, 502, `a refused client secret was reported to the caller as ${status}`);
   assert.match(message, /refused the exchange with 401 \(invalid_client\)/u);
+});
+
+// The error code is a string the provider chooses that ends up in a message
+// handed back to whoever called and in a line this server logs. RFC 6749 §A.7
+// says what a code may be made of; what is not a code is not repeated as one,
+// and a value that is too long is refused rather than cut down to size, since
+// a code cut down to size is a different code.
+test('does not hand back a provider string that is no error code', async () => {
+  const { status, message } = await refusedExchange(
+    's-token-error-oversized',
+    400,
+    JSON.stringify({ error: 'e'.repeat(200000) }),
+  );
+
+  assert.equal(status, 502, 'a string that is no error code was read as a verdict on the caller');
+  assert.ok(!/eeeeeeee/u.test(message), 'the message repeats a string the provider chose');
+  assert.ok(message.length < 200, `the message the provider dictated is ${message.length} characters long`);
+});
+
+// A line break in a code the provider chose is a line in this server's log
+// that the provider wrote, and a log line nobody wrote is a log line nobody
+// can trust.
+test('does not let an error code carry a line of its own into the log', async () => {
+  const { status, message } = await refusedExchange(
+    's-token-error-newline',
+    400,
+    JSON.stringify({ error: 'invalid_grant\nWARN fake log line' }),
+  );
+
+  assert.equal(status, 502, 'a string that is no error code was read as a verdict on the caller');
+  assert.ok(!message.includes('\n'), 'the message carries a line break the provider chose');
+  assert.ok(!/WARN/u.test(message), 'the message carries a line the provider wrote');
+});
+
+// A refusal whose body never finishes is a wait, not a verdict. The deadline
+// is what ends it, and the status that says "waited and got nothing" is the
+// one an operator can tell apart at a glance — folded into the refusal, it
+// reads as the provider having judged this callback, which it never did.
+test('gives up on a refusal that stops mid-body', { timeout: BEYOND_PATIENCE_MS }, async () => {
+  const handler = await exchangingHandler('s-refusal-stalls');
+
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (_input: unknown, init?: { signal?: AbortSignal }) => {
+    // The status arrives, the statement that would give it meaning does not.
+    const stalling = stallsMidBody('application/json', init);
+    return new Response(stalling.body, { status: 400 });
+  }) as unknown as typeof fetch;
+
+  try {
+    await assert.rejects(
+      handler.login(callback({ state: 's-refusal-stalls', code: 'c' })),
+      (error: unknown): boolean => statusOf(error) === 504 && /did not answer within/u.test(String(error)),
+    );
+  } finally {
+    globalThis.fetch = original;
+  }
 });
 
 // The deadline has to cover the answer, not just its first byte. A provider
