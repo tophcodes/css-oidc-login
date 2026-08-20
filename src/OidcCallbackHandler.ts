@@ -3,7 +3,7 @@ import { DataFactory, Parser, Store } from 'n3';
 import type { Term } from 'n3';
 import {
   ResolveLoginHandler, BadRequestHttpError, ConflictHttpError, ForbiddenHttpError, HttpError,
-  RepresentationMetadata,
+  InternalServerError, RepresentationMetadata,
 } from '@solid/community-server';
 import type {
   AccountStore, CookieStore, JsonInteractionHandlerInput,
@@ -35,6 +35,23 @@ export const DEFAULT_TRUST_PREDICATE = 'https://tophcodes.github.io/css-oidc-log
 export const GRANT_ISSUER_PREDICATE = 'https://tophcodes.github.io/css-oidc-login/ns#issuer';
 export const GRANT_SUBJECT_PREDICATE = 'https://tophcodes.github.io/css-oidc-login/ns#subject';
 
+/**
+ * What a configured predicate has to look like to be a predicate at all: a
+ * scheme, and after it only characters an IRI may carry in a Turtle document —
+ * anything except the space, the control characters, and the delimiters
+ * `<>"{}|^` and the backslash.
+ *
+ * Nothing narrower than that. The predicate is compared as a string against
+ * what a profile carries and is never dereferenced, so a term of a
+ * deployment's own vocabulary is as usable here under any scheme as an
+ * `https:` one, and asking more of it would refuse terms that work.
+ *
+ * What this refuses is a value no parsed document can ever yield a predicate
+ * for — a relative IRI, an empty string, one carrying a space or a delimiter.
+ * Such a value matches every profile alike: not at all.
+ */
+const USABLE_PREDICATE = /^[A-Za-z][A-Za-z0-9+\-.]*:[^\u0000-\u0020<>"{}|^\\`]*$/u;
+
 export interface WebIdLinkStorage {
   find: (type: string, query: { webId: string }) => Promise<{ accountId: string }[]>;
 }
@@ -53,8 +70,9 @@ export interface OidcCallbackHandlerArgs {
   /** Claim holding the user's WebID. Defaults to `webid` (Solid-OIDC). */
   webIdClaim?: string;
   /**
-   * Predicate a profile uses to attach a grant to its WebID. Defaults to
-   * {@link DEFAULT_TRUST_PREDICATE}. Never set this to `solid:oidcIssuer`.
+   * Predicate a profile uses to attach a grant to its WebID. An absolute IRI,
+   * under whatever scheme; defaults to {@link DEFAULT_TRUST_PREDICATE}. Never
+   * set this to `solid:oidcIssuer`.
    */
   trustPredicate?: string;
 }
@@ -150,8 +168,24 @@ const isNode = (term: Term): boolean => term.termType === 'NamedNode' || term.te
 export class OidcCallbackHandler extends ResolveLoginHandler {
   private readonly args: OidcCallbackHandlerArgs;
 
+  /**
+   * The trust predicate is this deployment's setting, and nothing further down
+   * is in a position to say so: n3 makes a named node out of any string at all,
+   * so a value that could never appear as a predicate in a profile is refused
+   * nowhere — it matches nothing in every profile, and each login then ends as
+   * a 403 telling a person their profile does not grant what it plainly does.
+   * The value arrives here, so it is judged here, and an operator meets their
+   * own typo at startup instead of reading it as somebody else's missing
+   * permission.
+   */
   public constructor(args: OidcCallbackHandlerArgs) {
     super(args.accountStore, args.cookieStore);
+    if (args.trustPredicate !== undefined && !USABLE_PREDICATE.test(args.trustPredicate)) {
+      throw new InternalServerError(
+        `The configured trust predicate ${args.trustPredicate} is not an absolute IRI, so no profile can ` +
+        'carry a grant under it and every login would be refused as if its owner had granted nothing.',
+      );
+    }
     this.args = args;
   }
 

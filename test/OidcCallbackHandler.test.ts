@@ -936,6 +936,53 @@ test('refuses the default predicate when another one is configured', async () =>
   );
 });
 
+// A term of a deployment's own vocabulary is a term under whatever scheme it
+// keeps that vocabulary in. The predicate is compared as a string and never
+// dereferenced, so nothing here needs it to be resolvable, and a guard asking
+// for an `https:` URL would refuse a working deployment.
+test('honours a configured trust predicate under a scheme of its own', async () => {
+  const predicate = 'urn:example:vocab:acceptsLoginFrom';
+  const handler = await profileCheckingHandler('s-predicate-urn', predicate);
+
+  await withProfile(profileGranting('https://idp.example', SUBJECT, predicate), async () => {
+    const { json } = await handler.login(callback({ state: 's-predicate-urn', code: 'c' }));
+    assert.equal(json.accountId, 'acc-1');
+  });
+});
+
+// The predicate is deployment configuration, and n3 makes a named node out of
+// any string at all — so a value that can never be a predicate in a parsed
+// profile was refused nowhere. It matched nothing in every profile, and every
+// login died at the grant check as a 403 telling a person that the profile
+// they wrote grants nothing. The setting is judged where it is supplied, so an
+// operator's typo is reported as their own error rather than as somebody
+// else's missing permission.
+test('refuses a configured trust predicate that could never be one', async () => {
+  const unusable = [
+    'externalLogin',
+    '/css-oidc-login/ns#externalLogin',
+    'https://tophcodes.github.io/css-oidc-login/ns#external login',
+    'https://example.org/ns#<externalLogin>',
+    '',
+  ];
+
+  for (const predicate of unusable) {
+    assert.throws(
+      () => makeHandler({}, [{ id: 'l1', webId: WEBID, accountId: 'acc-1' }], undefined, predicate),
+      (error: unknown): boolean => {
+        assert.equal(
+          statusOf(error),
+          500,
+          `a trust predicate of ${predicate} was reported as ${statusOf(error)}`,
+        );
+        assert.match(String(error), /configured trust predicate .*is not an absolute IRI/u);
+        assert.ok(String(error).includes(predicate), `the refusal does not name ${predicate}`);
+        return true;
+      },
+    );
+  }
+});
+
 // A profile that never answers holds a worker for as long as it likes, and one
 // that never stops holds its memory. The stub below stands in for both.
 
