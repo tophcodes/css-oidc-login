@@ -38,8 +38,8 @@ export const GRANT_SUBJECT_PREDICATE = 'https://tophcodes.github.io/css-oidc-log
 /**
  * What a configured predicate has to look like to be a predicate at all: a
  * scheme, and after it only characters an IRI may carry in a Turtle document —
- * anything except the space, the control characters, and the delimiters
- * `<>"{}|^` and the backslash.
+ * anything except the space, the control characters, the backtick, and the
+ * delimiters `<>"{}|^` and the backslash.
  *
  * Nothing narrower than that. The predicate is compared as a string against
  * what a profile carries and is never dereferenced, so a term of a
@@ -662,7 +662,7 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
       );
     }
 
-    return this.readCapped(webId, response);
+    return this.readProfileBody(webId, response);
   }
 
   /**
@@ -673,7 +673,7 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
    * client as an internal fault of this server for a wait on somebody else's
    * host.
    */
-  private async readCapped(webId: string, response: Response): Promise<string> {
+  private async readProfileBody(webId: string, response: Response): Promise<string> {
     try {
       return await readCapped(
         response,
