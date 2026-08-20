@@ -2,7 +2,8 @@ import { timingSafeEqual } from 'node:crypto';
 import { DataFactory, Parser, Store } from 'n3';
 import type { Term } from 'n3';
 import {
-  ResolveLoginHandler, BadRequestHttpError, HttpError, RepresentationMetadata,
+  ResolveLoginHandler, BadRequestHttpError, ConflictHttpError, ForbiddenHttpError, HttpError,
+  RepresentationMetadata,
 } from '@solid/community-server';
 import type {
   AccountStore, CookieStore, JsonInteractionHandlerInput,
@@ -59,20 +60,54 @@ export interface OidcCallbackHandlerArgs {
 }
 
 /**
- * A token exchange that never gets an answer out of the provider went wrong
- * somewhere the caller has no part in: the endpoint is the one discovery
- * named, and the request carries this server's own credentials. Reporting that
- * as a bad request blames a browser for a host being down, and buries the one
- * failure an operator can act on among the many that are genuinely the
- * caller's. So it is reported as the provider's — 502 for a provider that
- * answered in a way that is no answer at all, and 504 for one that did not
- * answer inside the deadline, which is the case an operator can tell apart at
- * a glance. What the provider does say about the code, verifier and redirect
- * URI presented to it stays a 400: that is a verdict on the callback this
- * caller brought.
+ * Two hosts answer to this handler, and the caller is neither of them: the
+ * provider, at the endpoint its own discovery document named and with this
+ * server's credentials in the request, and the host serving the profile that
+ * the WebID in the provider's token resolves to. Neither is anything a browser
+ * chose, so a failure at either is reported as the upstream failure it is —
+ * 502 for a host that answered in a way that is no answer at all, and 504 for
+ * one that did not answer inside the deadline, which is the case an operator
+ * can tell apart at a glance. Reporting either as a bad request blames a
+ * browser for somebody else's host, and buries the one failure an operator can
+ * act on among the many that are genuinely the caller's.
+ *
+ * What the provider says about the code, verifier and redirect URI presented
+ * to it stays a 400: that is a verdict on the callback this caller brought.
+ * What the profile says about who may log in is neither — see
+ * {@link loginRefused}.
  */
-const providerFailed = (message: string): HttpError => new HttpError(502, 'BadGatewayHttpError', message);
-const providerTimedOut = (message: string): HttpError => new HttpError(504, 'GatewayTimeoutHttpError', message);
+const upstreamFailed = (message: string): HttpError => new HttpError(502, 'BadGatewayHttpError', message);
+const upstreamTimedOut = (message: string): HttpError => new HttpError(504, 'GatewayTimeoutHttpError', message);
+
+/**
+ * A login that nothing upstream failed on and this server still will not
+ * complete: the profile carries no grant for it, or no account here is linked
+ * to the WebID. Nothing in the request is malformed and no host misbehaved —
+ * what is missing is permission, which is what a 403 says and a 400 does not.
+ * Whoever reads it is also the one who can grant it, by writing the grant into
+ * the profile or by linking the WebID to an account here.
+ */
+const loginRefused = (message: string): HttpError => new ForbiddenHttpError(message);
+
+/**
+ * What a WebID claim has to look like before this server fetches it and
+ * repeats it in a message: an absolute http(s) URL with nothing in it that a
+ * log line would read as a line of its own. The claim is a string chosen at
+ * the provider, and for a mapped attribute that is a string chosen by whoever
+ * holds the account there — so a value outside this is refused rather than
+ * passed on, the same way an error code outside its charset is.
+ */
+const isUsableWebId = (value: string): boolean => {
+  if (/[\u0000-\u0020\u007F]/u.test(value)) {
+    return false;
+  }
+  try {
+    const { protocol } = new URL(value);
+    return protocol === 'https:' || protocol === 'http:';
+  } catch {
+    return false;
+  }
+};
 
 /**
  * The statuses RFC 6749 §5.2 uses for an answer that says something about the
@@ -125,18 +160,36 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
   ): Promise<JsonRepresentation<LoginOutputType>> {
     assertPostOnly(method);
 
-    const { state, code } = json as { state?: string; code?: string };
-    if (!state) {
+    // The body and the cookie jar are the caller's own, and a browser can be
+    // made to send any shape of either: a body that is not an object of two
+    // strings, or a jar holding two cookies of the one name. Read without
+    // being asked about, each leaves this handler as an exception of this
+    // server's own — a fault reported for input somebody else chose.
+    if (typeof json !== 'object' || json === null || Array.isArray(json)) {
+      throw new BadRequestHttpError('Callback carried no parameters.');
+    }
+    const { state, code } = json as { state?: unknown; code?: unknown };
+    if (typeof state !== 'string' || state.length === 0) {
       throw new BadRequestHttpError('Callback carried no state.');
     }
-    if (!code) {
+    if (typeof code !== 'string' || code.length === 0) {
       throw new BadRequestHttpError('Callback carried no code.');
     }
 
     // The cookie is the browser's half of the login, and the half an attacker
     // holding a state and a code does not have.
     const { store } = this.args;
-    const handle = metadata.get(namedNode(store.cookiePredicate))?.value;
+    const handles = metadata.getAll(namedNode(store.cookiePredicate));
+    // Which of several is the one this login was started with is not knowable
+    // here, and trying each in turn would turn the check into a search that a
+    // caller decides the length of.
+    if (handles.length > 1) {
+      throw new BadRequestHttpError(
+        `Callback carried ${handles.length} ${store.cookieName} cookies; ` +
+        'a browser holds one login in progress, so exactly one belongs to it.',
+      );
+    }
+    const handle = handles[0]?.value;
     if (!handle) {
       throw new BadRequestHttpError(
         `Callback carried no ${store.cookieName} cookie, ` +
@@ -160,23 +213,49 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
     const claims = await this.exchange(code, pending.codeVerifier);
     const claimName = this.args.webIdClaim ?? 'webid';
     const webId = claims[claimName];
-    if (typeof webId !== 'string') {
-      throw new BadRequestHttpError(`The provider returned no webid claim (${claimName}) for this user.`);
+    // A token minted without the claim is the provider answering a request
+    // this deployment composed: the scopes it asks for, or the claim mapping
+    // its client is registered with at the provider, do not produce the claim.
+    // The person at the browser has no part in either and nothing to do about
+    // it, and told as their bad request it is also the failure an operator is
+    // least likely to find, arriving among every genuinely bad callback the
+    // route refuses all day.
+    if (typeof webId !== 'string' || webId.length === 0) {
+      throw upstreamFailed(
+        `The ID token carries no webid claim (${claimName}). A provider emits it only for a client ` +
+        'whose registered scopes and claim mapping ask for it.',
+      );
     }
+    if (!isUsableWebId(webId)) {
+      throw upstreamFailed(
+        `The ID token carries a webid claim (${claimName}) that is not an absolute http(s) URL, ` +
+        'so it names no profile this server could read.',
+      );
+    }
+    // OIDC Core 2 makes `sub` REQUIRED: a token without one is not a token the
+    // provider was allowed to compose, whatever the request asked of it.
     const subject = claims.sub;
     if (typeof subject !== 'string' || subject.length === 0) {
-      throw new BadRequestHttpError('ID token carried no subject.');
+      throw upstreamFailed(
+        'The ID token carries no subject (sub), which every ID token is required to carry.',
+      );
     }
 
     const links = await this.args.storage.find(WEBID_STORAGE_TYPE, { webId });
     if (links.length === 0) {
-      throw new BadRequestHttpError(`WebID ${webId} is not linked to an account on this server.`);
+      throw loginRefused(
+        `WebID ${webId} is not linked to an account on this server; ` +
+        'link it to one before logging in with it.',
+      );
     }
     // Which of several accounts was meant is not knowable here, and the order
     // the storage returns them in is not defined, so picking one would be a
-    // guess about who is logging in.
+    // guess about who is logging in. The ambiguity sits in this server's own
+    // account data rather than in the request or at either host, so it is
+    // answered as the conflict it is: the same login would be granted if that
+    // data named one account.
     if (links.length > 1) {
-      throw new BadRequestHttpError(
+      throw new ConflictHttpError(
         `WebID ${webId} is linked to ${links.length} accounts on this server; ` +
         'unlink it from all but one to log in with it.',
       );
@@ -220,12 +299,12 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
     } catch (error) {
       const name = (error as { name?: string }).name;
       if (name === 'TimeoutError' || name === 'AbortError') {
-        throw providerTimedOut(`The token endpoint did not answer within ${RESPONSE_TIMEOUT_MS}ms.`);
+        throw upstreamTimedOut(`The token endpoint did not answer within ${RESPONSE_TIMEOUT_MS}ms.`);
       }
-      throw providerFailed('The token endpoint could not be reached.');
+      throw upstreamFailed('The token endpoint could not be reached.');
     }
     if (response.status >= 300 && response.status < 400) {
-      throw providerFailed(
+      throw upstreamFailed(
         'The token endpoint redirects elsewhere; the exchange has to happen at the endpoint discovery named.',
       );
     }
@@ -235,7 +314,7 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
 
     const body = this.parseTokenResponse(await this.readTokenBody(response));
     if (typeof body.id_token !== 'string' || body.id_token.length === 0) {
-      throw providerFailed('The token response carried no ID token.');
+      throw upstreamFailed('The token response carried no ID token.');
     }
 
     // The signature is not re-verified, which OIDC Core 3.1.3.7 permits: the
@@ -262,7 +341,7 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
     try {
       return await readCapped(
         response,
-        (): Error => providerFailed(`The token response is larger than ${RESPONSE_MAX_BYTES} bytes.`),
+        (): Error => upstreamFailed(`The token response is larger than ${RESPONSE_MAX_BYTES} bytes.`),
       );
     } catch (error) {
       if (HttpError.isInstance(error)) {
@@ -270,9 +349,9 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
       }
       const name = (error as { name?: string }).name;
       if (name === 'TimeoutError' || name === 'AbortError') {
-        throw providerTimedOut(`The token endpoint did not answer within ${RESPONSE_TIMEOUT_MS}ms.`);
+        throw upstreamTimedOut(`The token endpoint did not answer within ${RESPONSE_TIMEOUT_MS}ms.`);
       }
-      throw providerFailed('The token response could not be read.');
+      throw upstreamFailed('The token response could not be read.');
     }
   }
 
@@ -302,7 +381,7 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
     if (code === CALLER_ERROR_CODE && OAUTH_ERROR_STATUSES.has(status)) {
       return new BadRequestHttpError(`Token exchange failed with ${status} (${code}).`);
     }
-    return providerFailed(
+    return upstreamFailed(
       `The token endpoint refused the exchange with ${status}${code ? ` (${code})` : ''}.`,
     );
   }
@@ -329,7 +408,7 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
     } catch (error) {
       const name = (error as { name?: string }).name;
       if (name === 'TimeoutError' || name === 'AbortError') {
-        throw providerTimedOut(`The token endpoint did not answer within ${RESPONSE_TIMEOUT_MS}ms.`);
+        throw upstreamTimedOut(`The token endpoint did not answer within ${RESPONSE_TIMEOUT_MS}ms.`);
       }
       return undefined;
     }
@@ -360,10 +439,10 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
     try {
       parsed = JSON.parse(body);
     } catch {
-      throw providerFailed('The token response is not valid JSON.');
+      throw upstreamFailed('The token response is not valid JSON.');
     }
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-      throw providerFailed('The token response is not a JSON object.');
+      throw upstreamFailed('The token response is not a JSON object.');
     }
     return parsed as { id_token?: unknown };
   }
@@ -379,17 +458,17 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
   private decodeClaims(idToken: string): Record<string, unknown> {
     const parts = idToken.split('.');
     if (parts.length !== 3 || parts[1].length === 0) {
-      throw providerFailed('The ID token is not a well-formed JWT.');
+      throw upstreamFailed('The ID token is not a well-formed JWT.');
     }
 
     let payload: unknown;
     try {
       payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
     } catch {
-      throw providerFailed('The ID token payload is not valid JSON.');
+      throw upstreamFailed('The ID token payload is not valid JSON.');
     }
     if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
-      throw providerFailed('The ID token payload is not a JSON object.');
+      throw upstreamFailed('The ID token payload is not a JSON object.');
     }
     return payload as Record<string, unknown>;
   }
@@ -406,31 +485,46 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
    * alone would let another client of the same provider mint a token for
    * itself that also lists this one, and checking `azp` only for several
    * audiences would let it mint one addressed solely to this client.
+   *
+   * Nothing a caller sends reaches any of these claims. They are the
+   * provider's own composition, matched against this deployment's configured
+   * issuer and client id, so every refusal here is the provider having minted
+   * a token that is not this server's — or this server's own configuration
+   * naming a provider or a client it was not registered as. Both are the
+   * operator's to act on and neither is a bad request, so each names the
+   * configured value it was measured against.
    */
   private assertIssuedForUs(claims: Record<string, unknown>): void {
     const expectedIssuer = withoutTrailingSlashes(this.args.issuer);
     if (typeof claims.iss !== 'string') {
-      throw new BadRequestHttpError('ID token carried no issuer.');
+      throw upstreamFailed('The ID token carries no issuer (iss).');
     }
     const actualIssuer = withoutTrailingSlashes(claims.iss);
     if (actualIssuer !== expectedIssuer) {
-      throw new BadRequestHttpError(`ID token was issued by ${claims.iss}, not by ${expectedIssuer}.`);
+      throw upstreamFailed(
+        `The ID token was issued by an issuer other than the configured ${expectedIssuer}.`,
+      );
     }
 
     if (claims.aud === undefined || claims.aud === null) {
-      throw new BadRequestHttpError('ID token carried no audience.');
+      throw upstreamFailed('The ID token carries no audience (aud).');
     }
     const audience = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
     if (!audience.includes(this.args.clientId)) {
-      throw new BadRequestHttpError('ID token was issued for a different client.');
+      throw upstreamFailed(
+        `The ID token was issued for a different client than the configured ${this.args.clientId}.`,
+      );
     }
     const azpPresent = 'azp' in claims && claims.azp !== undefined;
     if (azpPresent && claims.azp !== this.args.clientId) {
-      throw new BadRequestHttpError('ID token names another client as the authorized party.');
+      throw upstreamFailed(
+        `The ID token names another client than the configured ${this.args.clientId} ` +
+        'as the authorized party (azp).',
+      );
     }
     if (!azpPresent && audience.length > 1) {
-      throw new BadRequestHttpError(
-        'ID token names several audiences without naming this client as the authorized party.',
+      throw upstreamFailed(
+        'The ID token names several audiences without naming an authorized party (azp).',
       );
     }
   }
@@ -459,7 +553,7 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
     try {
       quads = new Parser({ baseIRI: webId }).parse(body);
     } catch {
-      throw new BadRequestHttpError(`The profile at ${webId} could not be parsed as ${PROFILE_MEDIA_TYPE}.`);
+      throw upstreamFailed(`The profile at ${webId} could not be parsed as ${PROFILE_MEDIA_TYPE}.`);
     }
 
     const store = new Store(quads);
@@ -472,8 +566,9 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
           term.termType === 'NamedNode' && withoutTrailingSlashes(term.value) === expected));
 
     if (grants.length === 0) {
-      throw new BadRequestHttpError(
-        `The profile at ${webId} does not accept authentication from ${expected}.`,
+      throw loginRefused(
+        `The profile at ${webId} does not accept authentication from ${expected}; ` +
+        'its owner has to state that it does before this login can be completed.',
       );
     }
 
@@ -484,8 +579,9 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
         .some((term): boolean => term.termType === 'Literal' && term.value === subject));
 
     if (!bound) {
-      throw new BadRequestHttpError(
-        `The profile at ${webId} does not accept ${subject} as its subject at ${expected}.`,
+      throw loginRefused(
+        `The profile at ${webId} does not accept ${subject} as its subject at ${expected}; ` +
+        'its owner has to name that subject in the grant before this login can be completed.',
       );
     }
   }
@@ -494,6 +590,15 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
    * Reads a profile document, refusing anything that is not plain Turtle served
    * from the WebID's own URL, and giving up rather than waiting or reading
    * without end.
+   *
+   * The host this waits on is not the caller's either. The URL is derived from
+   * a WebID this server was handed in the provider's token, so a host that is
+   * down, that answers with a status, that serves another media type or that
+   * redirects is a host failing, exactly as the token endpoint is when it does
+   * the same. Reported as the caller's, an operator whose pods serve profiles
+   * as JSON-LD, or whose profile host is unreachable from this server, sees
+   * every login die as somebody's bad request. What the profile *says* is a
+   * different matter — see {@link assertProfileGrantsLogin}.
    */
   private async fetchProfile(webId: string): Promise<string> {
     let response: Response;
@@ -504,21 +609,21 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
         signal: AbortSignal.timeout(RESPONSE_TIMEOUT_MS),
       });
     } catch (error) {
-      throw new BadRequestHttpError(this.describeProfileFailure(webId, error));
+      throw this.describeProfileFailure(webId, error);
     }
 
     if (response.status >= 300 && response.status < 400) {
-      throw new BadRequestHttpError(
+      throw upstreamFailed(
         `The profile at ${webId} redirects elsewhere; it has to be served from the WebID's own URL.`,
       );
     }
     if (!response.ok) {
-      throw new BadRequestHttpError(`Could not read the profile at ${webId} (${response.status}).`);
+      throw upstreamFailed(`The host serving the profile at ${webId} answered with ${response.status}.`);
     }
 
     const mediaType = (response.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase();
     if (mediaType !== PROFILE_MEDIA_TYPE) {
-      throw new BadRequestHttpError(
+      throw upstreamFailed(
         `The profile at ${webId} was served as ${mediaType || 'no media type'}, not as ${PROFILE_MEDIA_TYPE}.`,
       );
     }
@@ -526,27 +631,39 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
     return this.readCapped(webId, response);
   }
 
-  /** Reads the profile body, refusing one that never stops arriving. */
+  /**
+   * Reads the profile body, refusing one that never stops arriving. The
+   * deadline covers the body as well as the headers, so a host that answers
+   * and then trickles trips it here rather than at the fetch, and what ends
+   * such a read is not an `HttpError` at all — left unmapped it reaches the
+   * client as an internal fault of this server for a wait on somebody else's
+   * host.
+   */
   private async readCapped(webId: string, response: Response): Promise<string> {
     try {
       return await readCapped(
         response,
-        (): Error =>
-          new BadRequestHttpError(`The profile at ${webId} is larger than ${RESPONSE_MAX_BYTES} bytes.`),
+        (): Error => upstreamFailed(`The profile at ${webId} is larger than ${RESPONSE_MAX_BYTES} bytes.`),
       );
     } catch (error) {
-      if (BadRequestHttpError.isInstance(error)) {
+      if (HttpError.isInstance(error)) {
         throw error;
       }
-      throw new BadRequestHttpError(this.describeProfileFailure(webId, error));
+      throw this.describeProfileFailure(webId, error);
     }
   }
 
-  private describeProfileFailure(webId: string, error: unknown): string {
+  /**
+   * A host that did not answer is told apart from one that answered badly, the
+   * same way the token endpoint's two are: it is the one case an operator can
+   * recognise without reading a log, and the one that says the wait was this
+   * server's to end.
+   */
+  private describeProfileFailure(webId: string, error: unknown): HttpError {
     const name = (error as { name?: string }).name;
     if (name === 'TimeoutError' || name === 'AbortError') {
-      return `The profile at ${webId} did not answer within ${RESPONSE_TIMEOUT_MS}ms.`;
+      return upstreamTimedOut(`The profile at ${webId} did not answer within ${RESPONSE_TIMEOUT_MS}ms.`);
     }
-    return `Could not read the profile at ${webId}.`;
+    return upstreamFailed(`The host serving the profile at ${webId} could not be reached.`);
   }
 }

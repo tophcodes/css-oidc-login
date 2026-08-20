@@ -91,6 +91,22 @@ const isBadRequest = (error: unknown): boolean =>
 
 const statusOf = (error: unknown): number | undefined => (error as { statusCode?: number }).statusCode;
 
+/**
+ * What an error says and whose failure it is reported as, in one predicate.
+ * The status is asserted rather than returned as a boolean so that a test
+ * which fails says which party the failure was handed to, instead of only
+ * that some error did not match.
+ */
+const isFailure = (status: number, message: RegExp) => (error: unknown): boolean => {
+  assert.equal(
+    statusOf(error),
+    status,
+    `expected a ${status}, got ${statusOf(error)} — the message was: ${String(error)}`,
+  );
+  assert.match(String(error), message);
+  return true;
+};
+
 const profileGranting = (
   issuer: string,
   subject: string = SUBJECT,
@@ -127,25 +143,52 @@ test('honours a custom claim name', async () => {
   assert.equal(json.accountId, 'acc-2');
 });
 
-test('rejects a token without the claim', async () => {
+// The documentation names the missing `profile` scope as what this looks
+// like, which makes it an operator who configured the scopes or the claim
+// mapping — never the person at the browser, who cannot act on it at all.
+test('reports a token without the claim as the provider\'s failure', async () => {
   const { handler, store } = makeHandler({ sub: SUBJECT }, []);
   await start(store, 's3');
 
-  await assert.rejects(handler.login(callback({ state: 's3', code: 'c' })), /no webid claim/u);
+  await assert.rejects(
+    handler.login(callback({ state: 's3', code: 'c' })),
+    isFailure(502, /no webid claim/u),
+  );
 });
 
-test('rejects a token without a subject', async () => {
+// A claim that is a string but names nothing this server can fetch is the same
+// failure: what came back was not a WebID, and the caller did not choose it.
+test('reports a claim that is no http URL as the provider\'s failure', async () => {
+  for (const [ index, claim ] of [ 'not a url', 'urn:uuid:1', 'https://pod.example/#me\nWARN', 5 ].entries()) {
+    const { handler, store } = makeHandler({ webid: claim, sub: SUBJECT }, []);
+    await start(store, `s3-claim-${index}`);
+
+    await assert.rejects(
+      handler.login(callback({ state: `s3-claim-${index}`, code: 'c' })),
+      isFailure(502, /webid claim/u),
+    );
+  }
+});
+
+// `sub` is REQUIRED of every ID token, so a token without one is a token the
+// provider was never allowed to compose.
+test('reports a token without a subject as the provider\'s failure', async () => {
   const { handler, store } = makeHandler({ webid: WEBID }, [{ id: 'l1', webId: WEBID, accountId: 'acc-1' }]);
   await start(store, 's3-sub');
 
-  await assert.rejects(handler.login(callback({ state: 's3-sub', code: 'c' })), /no subject/u);
+  await assert.rejects(
+    handler.login(callback({ state: 's3-sub', code: 'c' })),
+    isFailure(502, /no subject/u),
+  );
 });
 
-test('rejects a WebID no account is linked to', async () => {
+// Nothing in the request is wrong and no host failed: the identity is
+// established and this server will not log it in, which is what a 403 says.
+test('refuses a WebID no account is linked to', async () => {
   const { handler, store } = makeHandler({ webid: 'https://elsewhere.example/#me', sub: SUBJECT }, []);
   await start(store, 's4');
 
-  await assert.rejects(handler.login(callback({ state: 's4', code: 'c' })), /not linked/u);
+  await assert.rejects(handler.login(callback({ state: 's4', code: 'c' })), isFailure(403, /not linked/u));
 });
 
 // Which of several linked accounts was meant is not knowable from the token,
@@ -157,9 +200,11 @@ test('rejects a WebID that is linked to more than one account', async () => {
   ]);
   await start(store, 's-multi');
 
+  // The conflict is in this server's own account data, not in the request and
+  // not at either host, so it is answered as the conflict it is.
   await assert.rejects(
     handler.login(callback({ state: 's-multi', code: 'c' })),
-    (error: unknown): boolean => isBadRequest(error) && /linked to 2 accounts/u.test(String(error)),
+    isFailure(409, /linked to 2 accounts/u),
   );
 });
 
@@ -315,7 +360,10 @@ test('rejects a token issued by a different provider', async () => {
   await withTokenResponse(
     { iss: 'https://evil.example', aud: 'pod-client', sub: SUBJECT, webid: WEBID },
     async () => {
-      await assert.rejects(handler.login(callback({ state: 's6', code: 'c' })), /not by https:\/\/idp\.example/u);
+      await assert.rejects(
+        handler.login(callback({ state: 's6', code: 'c' })),
+        isFailure(502, /other than the configured https:\/\/idp\.example/u),
+      );
     },
   );
 });
@@ -326,7 +374,10 @@ test('rejects a token issued for a different client of the same provider', async
   await withTokenResponse(
     { iss: 'https://idp.example', aud: 'some-other-client', sub: SUBJECT, webid: WEBID },
     async () => {
-      await assert.rejects(handler.login(callback({ state: 's7', code: 'c' })), /different client/u);
+      await assert.rejects(
+        handler.login(callback({ state: 's7', code: 'c' })),
+        isFailure(502, /different client/u),
+      );
     },
   );
 });
@@ -337,7 +388,7 @@ test('rejects a token that carries no issuer', async () => {
   await withTokenResponse({ aud: 'pod-client', sub: SUBJECT, webid: WEBID }, async () => {
     await assert.rejects(
       handler.login(callback({ state: 's-no-iss', code: 'c' })),
-      (error: unknown): boolean => isBadRequest(error) && /no issuer/u.test(String(error)),
+      isFailure(502, /no issuer/u),
     );
   });
 });
@@ -348,7 +399,7 @@ test('rejects a token that carries no audience', async () => {
   await withTokenResponse({ iss: 'https://idp.example', sub: SUBJECT, webid: WEBID }, async () => {
     await assert.rejects(
       handler.login(callback({ state: 's-no-aud', code: 'c' })),
-      (error: unknown): boolean => isBadRequest(error) && /no audience/u.test(String(error)),
+      isFailure(502, /no audience/u),
     );
   });
 });
@@ -361,7 +412,7 @@ test('rejects a token whose aud array does not contain our client', async () => 
     async () => {
       await assert.rejects(
         handler.login(callback({ state: 's-foreign-aud', code: 'c' })),
-        /different client/u,
+        isFailure(502, /different client/u),
       );
     },
   );
@@ -390,7 +441,7 @@ test('rejects a multi-audience token that does not name us as the authorized par
     async () => {
       await assert.rejects(
         handler.login(callback({ state: 's-azp-missing', code: 'c' })),
-        (error: unknown): boolean => isBadRequest(error) && /authorized party/u.test(String(error)),
+        isFailure(502, /authorized party/u),
       );
     },
   );
@@ -410,7 +461,7 @@ test('rejects a multi-audience token whose azp names another client', async () =
     async () => {
       await assert.rejects(
         handler.login(callback({ state: 's-azp-wrong', code: 'c' })),
-        /authorized party/u,
+        isFailure(502, /authorized party/u),
       );
     },
   );
@@ -427,7 +478,7 @@ test('rejects a single-audience token whose azp names another client', async () 
     async () => {
       await assert.rejects(
         handler.login(callback({ state: 's-azp-single-foreign', code: 'c' })),
-        (error: unknown): boolean => isBadRequest(error) && /authorized party/u.test(String(error)),
+        isFailure(502, /authorized party/u),
       );
     },
   );
@@ -455,7 +506,7 @@ test('rejects a token whose azp is not a string', async () => {
     async () => {
       await assert.rejects(
         handler.login(callback({ state: 's-azp-not-string', code: 'c' })),
-        (error: unknown): boolean => isBadRequest(error) && /authorized party/u.test(String(error)),
+        isFailure(502, /authorized party/u),
       );
     },
   );
@@ -635,23 +686,33 @@ const profileCheckingHandler = async (state: string, trustPredicate?: string) =>
   return handler;
 };
 
+/**
+ * A profile the check will not use, and whose failure it is reported as. The
+ * two are not the same party: a host that will not serve the document is an
+ * upstream this server waits on, exactly as the token endpoint is, while a
+ * document that arrives and grants nothing is a permission that was never
+ * given. Neither is the browser that brought a state and a code.
+ */
 const assertProfileRejected = async (
   state: string,
   profile: string | ProfileResponse,
+  status: number,
   message: RegExp,
   trustPredicate?: string,
 ): Promise<void> => {
   const handler = await profileCheckingHandler(state, trustPredicate);
   await withProfile(profile, async () => {
-    await assert.rejects(
-      handler.login(callback({ state, code: 'c' })),
-      (error: unknown): boolean => isBadRequest(error) && message.test(String(error)),
-    );
+    await assert.rejects(handler.login(callback({ state, code: 'c' })), isFailure(status, message));
   });
 };
 
 test('refuses a valid token when the profile does not name the provider', async () => {
-  await assertProfileRejected('s9', profileGranting('https://other-idp.example'), /does not accept authentication/u);
+  await assertProfileRejected(
+    's9',
+    profileGranting('https://other-idp.example'),
+    403,
+    /does not accept authentication/u,
+  );
 });
 
 test('accepts when the profile grants this subject at the provider', async () => {
@@ -693,8 +754,7 @@ test('refuses a token for a different subject at the provider the profile does n
   try {
     await assert.rejects(
       handler.login(callback({ state: 's-other-subject', code: 'c' })),
-      (error: unknown): boolean => isBadRequest(error) && /does not accept subject-mallory as its subject/u
-        .test(String(error)),
+      isFailure(403, /does not accept subject-mallory as its subject/u),
     );
   } finally {
     globalThis.fetch = original;
@@ -705,6 +765,7 @@ test('refuses a grant that names the provider but no subject at all', async () =
   await assertProfileRejected(
     's-no-subject',
     `<${WEBID}> <${TRUST_PREDICATE}> [ <${GRANT_ISSUER_PREDICATE}> <https://idp.example> ] .`,
+    403,
     /does not accept .* as its subject/u,
   );
 });
@@ -718,6 +779,7 @@ test('refuses a grant whose subject is an IRI rather than a literal', async () =
        <${GRANT_ISSUER_PREDICATE}> <https://idp.example> ;
        <${GRANT_SUBJECT_PREDICATE}> <${SUBJECT}>
      ] .`,
+    403,
     /does not accept .* as its subject/u,
   );
 });
@@ -729,6 +791,7 @@ test('refuses a subject that belongs to a grant for another provider', async () 
     's-crossed-grants',
     `${profileGranting('https://idp.example', 'subject-here')}
      ${profileGranting('https://other-idp.example', SUBJECT)}`,
+    403,
     /does not accept .* as its subject/u,
   );
 });
@@ -743,6 +806,7 @@ test('refuses a grant made about a different subject', async () => {
        <${GRANT_ISSUER_PREDICATE}> <https://idp.example> ;
        <${GRANT_SUBJECT_PREDICATE}> "${SUBJECT}"
      ] .`,
+    403,
     /does not accept authentication/u,
   );
 });
@@ -754,6 +818,7 @@ test('refuses a grant made with a different predicate', async () => {
        <${GRANT_ISSUER_PREDICATE}> <https://idp.example> ;
        <${GRANT_SUBJECT_PREDICATE}> "${SUBJECT}"
      ] .`,
+    403,
     /does not accept authentication/u,
   );
 });
@@ -765,6 +830,7 @@ test('refuses a grant whose issuer is a literal', async () => {
        <${GRANT_ISSUER_PREDICATE}> "https://idp.example" ;
        <${GRANT_SUBJECT_PREDICATE}> "${SUBJECT}"
      ] .`,
+    403,
     /does not accept authentication/u,
   );
 });
@@ -773,6 +839,7 @@ test('refuses a grant parked in a named graph', async () => {
   await assertProfileRejected(
     's-graph',
     `<https://pod.example/alice/other> { ${profileGranting('https://idp.example')} }`,
+    403,
     /does not accept authentication/u,
   );
 });
@@ -784,6 +851,7 @@ test('refuses a profile that is not served as Turtle', async () => {
       body: JSON.stringify({ '@id': WEBID, [TRUST_PREDICATE]: { '@id': 'https://idp.example' }}),
       contentType: 'application/ld+json',
     },
+    502,
     /not as text\/turtle/u,
   );
 });
@@ -792,20 +860,59 @@ test('refuses a profile served without a media type', async () => {
   await assertProfileRejected(
     's-no-content-type',
     { body: profileGranting('https://idp.example'), contentType: null },
+    502,
     /no media type/u,
   );
+});
+
+// A host that will not serve the document at all is the clearest case of the
+// two the profile fetch has to tell apart: nothing about it is a statement on
+// this login, and nobody at a browser can make it answer.
+test('reports a profile host that answers with a status as its failure', async () => {
+  for (const [ index, status ] of [ 404, 401, 500, 503 ].entries()) {
+    await assertProfileRejected(
+      `s-profile-status-${index}`,
+      { status, contentType: null },
+      502,
+      new RegExp(`answered with ${status}`, 'u'),
+    );
+  }
+});
+
+test('reports a profile host that cannot be reached as its failure', async () => {
+  const handler = await profileCheckingHandler('s-profile-unreachable');
+
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (input: unknown) => {
+    if (String(input).includes('/token')) {
+      return new Response(JSON.stringify({
+        id_token: idToken({ iss: 'https://idp.example', aud: 'pod-client', sub: SUBJECT, webid: WEBID }),
+      }), { status: 200 });
+    }
+    throw new TypeError('fetch failed');
+  }) as unknown as typeof fetch;
+
+  try {
+    await assert.rejects(
+      handler.login(callback({ state: 's-profile-unreachable', code: 'c' })),
+      isFailure(502, /could not be reached/u),
+    );
+  } finally {
+    globalThis.fetch = original;
+  }
 });
 
 test('refuses a profile that redirects to another document', async () => {
   await assertProfileRejected(
     's-redirect',
     { status: 302, location: 'https://elsewhere.example/card', contentType: null },
+    502,
     /redirects elsewhere/u,
   );
 });
 
 test('refuses a profile whose body is not parseable', async () => {
-  await assertProfileRejected('s-broken', '<not> <turtle', /could not be parsed/u);
+  await assertProfileRejected('s-broken', '<not> <turtle', 502, /could not be parsed/u);
 });
 
 // The predicate is configurable, so a deployment can use a term of its own.
@@ -823,6 +930,7 @@ test('refuses the default predicate when another one is configured', async () =>
   await assertProfileRejected(
     's-predicate-mismatch',
     profileGranting('https://idp.example'),
+    403,
     /does not accept authentication/u,
     'https://example.org/ns#acceptsLoginFrom',
   );
@@ -850,7 +958,7 @@ test('gives up on a profile that does not answer', { timeout: BEYOND_PATIENCE_MS
   try {
     await assert.rejects(
       handler.login(callback({ state: 's-timeout', code: 'c' })),
-      (error: unknown): boolean => isBadRequest(error) && /did not answer within/u.test(String(error)),
+      isFailure(504, /did not answer within/u),
     );
   } finally {
     globalThis.fetch = original;
@@ -1109,7 +1217,7 @@ test('gives up on a profile that keeps sending', { timeout: DEADLINE_BOUND_MS },
   try {
     await assert.rejects(
       handler.login(callback({ state: 's-huge', code: 'c' })),
-      (error: unknown): boolean => isBadRequest(error) && /is larger than/u.test(String(error)),
+      isFailure(502, /is larger than/u),
     );
   } finally {
     globalThis.fetch = original;
@@ -1146,6 +1254,65 @@ test('clears the pending-login cookie once the login is redeemed', async () => {
   const { metadata } = await handler.login(callback({ state: 's-clear', code: 'c' }));
   const header = metadata?.get(namedNode(setCookiePredicate))?.value;
   assert.match(String(header), /Max-Age=0/u);
+});
+
+// Everything a caller sends is a shape they chose, including the shapes this
+// server did not think to expect. A body that is not an object and a cookie
+// jar holding two of the one cookie both used to leave this handler as an
+// exception of its own — a fault of this server reported for input somebody
+// else picked, which is the mirror image of blaming a caller for the provider.
+
+test('reports a callback body that is no object as the caller\'s', async () => {
+  const { handler, store } = makeHandler({ webid: WEBID, sub: SUBJECT }, []);
+  await start(store, 's-body');
+
+  for (const body of [ null, undefined, 'a string', 5, [], true ]) {
+    await assert.rejects(
+      handler.login(callback(body)),
+      isFailure(400, /Callback carried no/u),
+      `a body of ${JSON.stringify(body) ?? 'undefined'} was not answered as the caller's`,
+    );
+    assert.ok(await store.peek('s-body'), 'a body that is no object spent the login');
+  }
+});
+
+// The same for a state or a code that is present but is not a string: a JSON
+// body carries whatever types its author put in it.
+test('reports a state or code that is no string as the caller\'s', async () => {
+  const { handler, store } = makeHandler({ webid: WEBID, sub: SUBJECT }, []);
+  await start(store, 's-types');
+
+  for (const json of [
+    { state: 5, code: 'c' }, { state: {}, code: 'c' }, { state: '', code: 'c' },
+    { state: 's-types', code: 5 }, { state: 's-types', code: '' },
+  ]) {
+    await assert.rejects(
+      handler.login(callback(json)),
+      isFailure(400, /Callback carried no (state|code)/u),
+      `${JSON.stringify(json)} was not answered as the caller's`,
+    );
+  }
+});
+
+// A browser can be made to hold two cookies of one name — a sibling host that
+// once wrote one without the prefix, or a jar the person edited themselves.
+// Which of them belongs to this login is not knowable here.
+test('reports a browser holding several pending-login cookies as the caller\'s', async () => {
+  const { handler, store } = makeHandler(
+    { webid: WEBID, sub: SUBJECT },
+    [{ id: 'l1', webId: WEBID, accountId: 'acc-1' }],
+  );
+  await start(store, 's-two-cookies');
+
+  const metadata = new RepresentationMetadata(TARGET);
+  metadata.add(namedNode(cookiePredicate), HANDLE);
+  metadata.add(namedNode(cookiePredicate), 'a-second-handle');
+  const input = { method: 'POST', target: TARGET, json: { state: 's-two-cookies', code: 'c' }, metadata };
+
+  await assert.rejects(handler.login(input as never), isFailure(400, /2 __Host-.* cookies/u));
+  // And the login it named is untouched, so the browser that started it can
+  // still finish it once its jar holds one cookie again.
+  assert.ok(await store.peek('s-two-cookies'), 'a second cookie spent the login');
 });
 
 // Same exposure as the start route: a GET that prefers no particular type gets
