@@ -1,10 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { DataFactory } from 'n3';
 import {
   AbsolutePathInteractionRoute, InteractionRouteHandler, LocationInteractionHandler,
-  RelativePathInteractionRoute, WaterfallHandler,
+  RelativePathInteractionRoute, RepresentationMetadata, WaterfallHandler,
 } from '@solid/community-server';
 import type { JsonInteractionHandler } from '@solid/community-server';
+import { OidcCallbackHandler } from '../src/OidcCallbackHandler.ts';
 import { OidcRedirectHandler } from '../src/OidcRedirectHandler.ts';
 import { PendingLoginStore } from '../src/PendingLoginStore.ts';
 
@@ -17,7 +19,23 @@ import { PendingLoginStore } from '../src/PendingLoginStore.ts';
  * 400 with everything the individual errors carried — the method among it —
  * dropped, which is why the status is asserted here rather than only on the
  * handler.
+ *
+ * Both routes are wired, and both handlers are the real ones: each is the
+ * other's sibling in the waterfall, and the callback's answer travels one
+ * further step than the start route's, through the login resolution its
+ * handler inherits. That step is where a status of its own has been lost
+ * before.
  */
+const { namedNode } = DataFactory;
+
+const START = 'https://pod.example/.account/login/oidc/';
+const CALLBACK = 'https://pod.example/.account/login/oidc/callback/';
+const WEBID = 'https://pod.example/alice/profile/card#me';
+const HANDLE = 'handle-of-the-browser-that-started-the-login';
+
+/** Predicates are read off a store instance, the way the handlers read them. */
+const { cookiePredicate } = new PendingLoginStore();
+
 const chain = (store: PendingLoginStore): JsonInteractionHandler => {
   const base = new AbsolutePathInteractionRoute('https://pod.example/.account/login/');
   const startRoute = new RelativePathInteractionRoute(base, 'oidc/');
@@ -33,14 +51,32 @@ const chain = (store: PendingLoginStore): JsonInteractionHandler => {
     store,
     discovery: discovery as never,
     clientId: 'pod-client',
-    callbackUrl: 'https://pod.example/.account/login/oidc/callback/',
+    callbackUrl: CALLBACK,
   });
-  // A second route, so the waterfall has a sibling to disagree with, the way a
-  // deployment that wires both routes does. Its handler is never reached: what
-  // it contributes is the 404 of a route that was not asked for.
-  const callback = { canHandle: async (): Promise<void> => undefined, handle: async (): Promise<never> => {
-    throw new Error('the callback route answered a request for the start route');
-  }} as unknown as JsonInteractionHandler;
+
+  const callback = new OidcCallbackHandler({
+    accountStore: {
+      updateSetting: async (): Promise<void> => undefined,
+      getSetting: async (): Promise<undefined> => undefined,
+    } as never,
+    cookieStore: {
+      generate: async (): Promise<string> => 'account-cookie',
+      delete: async (): Promise<void> => undefined,
+    } as never,
+    store,
+    storage: { find: async (): Promise<unknown[]> => [{ id: 'l1', webId: WEBID, accountId: 'acc-1' }]} as never,
+    discovery: discovery as never,
+    issuer: 'https://idp.example',
+    clientId: 'pod-client',
+    clientSecret: 'shh',
+    callbackUrl: CALLBACK,
+  });
+  // Neither the provider nor the profile decides what this file is about: the
+  // method is refused before either is reached, and both have tests of their own.
+  (callback as unknown as { exchange: unknown }).exchange = async (): Promise<unknown> =>
+    ({ webid: WEBID, sub: 'subject-alice' });
+  (callback as unknown as { assertProfileGrantsLogin: unknown }).assertProfileGrantsLogin =
+    async (): Promise<undefined> => undefined;
 
   return new LocationInteractionHandler(new WaterfallHandler([
     new InteractionRouteHandler(startRoute, start),
@@ -48,12 +84,14 @@ const chain = (store: PendingLoginStore): JsonInteractionHandler => {
   ]));
 };
 
-const request = (method: string): never => ({
-  method,
-  target: { path: 'https://pod.example/.account/login/oidc/' },
-  json: {},
-  metadata: {},
-} as never);
+const request = (method: string, path = START, json: unknown = {}, handle?: string): never => {
+  const target = { path };
+  const metadata = new RepresentationMetadata(target);
+  if (handle) {
+    metadata.add(namedNode(cookiePredicate), handle);
+  }
+  return { method, target, json, metadata } as never;
+};
 
 const statusOf = (error: unknown): number | undefined => (error as { statusCode?: number }).statusCode;
 
@@ -78,16 +116,44 @@ test('answers a POST to the start route through the same chain', async () => {
   assert.ok(await store.peek(url.searchParams.get('state') as string));
 });
 
+// The same for the callback, whose refusal has one more step to survive: the
+// login resolution its handler inherits sits between it and the waterfall, and
+// a status that does not reach the client is a status nobody has.
+test('tells a client that reaches the callback route with the wrong method which methods it may use', async () => {
+  const store = new PendingLoginStore();
+  await store.create('s-routing', { codeVerifier: 'v', handle: HANDLE });
+  const handler = chain(store);
+
+  for (const method of [ 'GET', 'HEAD', 'PUT', 'DELETE', 'PATCH' ]) {
+    await assert.rejects(
+      handler.handleSafe(request(method, CALLBACK, { state: 's-routing', code: 'c' }, HANDLE)),
+      (error: unknown): boolean =>
+        statusOf(error) === 405 && /Only POST requests are supported/u.test(String(error)),
+      `${method} to the callback route was not refused as a method`,
+    );
+    // And the login it named is still there for the browser that started it.
+    assert.ok(await store.peek('s-routing'), `a ${method} spent the login`);
+  }
+});
+
+test('answers a POST to the callback route through the same chain', async () => {
+  const store = new PendingLoginStore();
+  await store.create('s-routing-post', { codeVerifier: 'v', handle: HANDLE });
+
+  const { json } = await chain(store)
+    .handleSafe(request('POST', CALLBACK, { state: 's-routing-post', code: 'c' }, HANDLE));
+
+  assert.equal(json.authorization, 'account-cookie');
+  assert.equal(await store.peek('s-routing-post'), undefined);
+});
+
 // A request for a route nobody claims is still a 404, so the status above is
 // not the waterfall having lost the ability to tell routes apart.
 test('still answers an unclaimed route with a not-found', async () => {
   const handler = chain(new PendingLoginStore());
-  const elsewhere = {
-    method: 'POST',
-    target: { path: 'https://pod.example/.account/login/password/' },
-    json: {},
-    metadata: {},
-  } as never;
 
-  await assert.rejects(handler.handleSafe(elsewhere), (error: unknown): boolean => statusOf(error) === 404);
+  await assert.rejects(
+    handler.handleSafe(request('POST', 'https://pod.example/.account/login/password/')),
+    (error: unknown): boolean => statusOf(error) === 404,
+  );
 });
