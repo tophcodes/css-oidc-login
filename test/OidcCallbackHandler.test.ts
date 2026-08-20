@@ -87,6 +87,8 @@ const callback = (json: unknown, handle: string | null = HANDLE): never => {
 const isBadRequest = (error: unknown): boolean =>
   (error as { statusCode?: number }).statusCode === 400;
 
+const statusOf = (error: unknown): number | undefined => (error as { statusCode?: number }).statusCode;
+
 const profileGranting = (
   issuer: string,
   subject: string = SUBJECT,
@@ -504,7 +506,7 @@ test('refuses to follow a redirect away from the token endpoint', async () => {
   try {
     await assert.rejects(
       handler.login(callback({ state: 's-token-redirect', code: 'c' })),
-      (error: unknown): boolean => isBadRequest(error) && /redirects elsewhere/u.test(String(error)),
+      (error: unknown): boolean => statusOf(error) === 502 && /redirects elsewhere/u.test(String(error)),
     );
     assert.deepEqual(leaked, [], 'the request body reached the redirect target');
   } finally {
@@ -820,7 +822,7 @@ test('gives up on a token endpoint that does not answer', { timeout: BEYOND_PATI
   try {
     await assert.rejects(
       handler.login(callback({ state: 's-token-timeout', code: 'c' })),
-      (error: unknown): boolean => isBadRequest(error) && /did not answer within/u.test(String(error)),
+      (error: unknown): boolean => statusOf(error) === 504 && /did not answer within/u.test(String(error)),
     );
   } finally {
     globalThis.fetch = original;
@@ -836,7 +838,52 @@ test('gives up on a token endpoint that keeps sending', { timeout: DEADLINE_BOUN
   try {
     await assert.rejects(
       handler.login(callback({ state: 's-token-huge', code: 'c' })),
-      (error: unknown): boolean => isBadRequest(error) && /is larger than/u.test(String(error)),
+      (error: unknown): boolean => statusOf(error) === 502 && /is larger than/u.test(String(error)),
+    );
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+// Nothing about the exchange is the caller's doing: the endpoint is the one
+// discovery named and the request carries this server's own credentials. A
+// host that is down is not a bad callback, and reporting it as one hides the
+// only failure an operator can act on among the many that really are the
+// caller's.
+test('blames the provider, not the caller, for a token endpoint it cannot reach', async () => {
+  const handler = await exchangingHandler('s-token-unreachable');
+
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    throw new TypeError('fetch failed');
+  }) as unknown as typeof fetch;
+
+  try {
+    await assert.rejects(
+      handler.login(callback({ state: 's-token-unreachable', code: 'c' })),
+      (error: unknown): boolean => statusOf(error) === 502 && /could not be reached/u.test(String(error)),
+    );
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+// The line between the two: what the endpoint says about the code, the
+// verifier and the redirect URI it was handed is a verdict on the callback
+// this caller brought — a code already spent or expired ends here — so it
+// stays the caller's failure.
+test('still blames the caller for what the token endpoint says about their code', async () => {
+  const handler = await exchangingHandler('s-token-rejected');
+
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({ error: 'invalid_grant' }), { status: 400 })
+  ) as unknown as typeof fetch;
+
+  try {
+    await assert.rejects(
+      handler.login(callback({ state: 's-token-rejected', code: 'c' })),
+      (error: unknown): boolean => isBadRequest(error) && /failed with 400/u.test(String(error)),
     );
   } finally {
     globalThis.fetch = original;
@@ -902,24 +949,31 @@ test('clears the pending-login cookie once the login is redeemed', async () => {
 });
 
 // Same exposure as the start route: a GET that prefers no particular type gets
-// past the HTML view and reaches this handler.
-test('refuses to complete a login on a GET', async () => {
+// past the HTML view and reaches this handler. And as there, GET is only the
+// method that arrives by accident — POST is the only one this route answers,
+// so anything else is refused as well.
+test('completes a login on a POST and on nothing else', async () => {
   const { handler, store } = makeHandler(
     { webid: WEBID, sub: SUBJECT },
     [{ id: 'l1', webId: WEBID, accountId: 'acc-1' }],
   );
-  await start(store, 's-get');
-
-  const metadata = new RepresentationMetadata(TARGET);
-  metadata.add(namedNode(cookiePredicate), HANDLE);
-  const get = { method: 'GET', target: TARGET, json: { state: 's-get', code: 'c' }, metadata } as never;
+  await start(store, 's-method');
 
   const isMethodNotAllowed = (error: unknown): boolean =>
     (error as { statusCode?: number }).statusCode === 405;
 
-  await assert.rejects(handler.handleSafe(get), isMethodNotAllowed);
-  await assert.rejects(handler.login(get), isMethodNotAllowed);
-  // The login it named is untouched, so the browser that started it can still
-  // finish it.
-  assert.ok(await store.peek('s-get'));
+  for (const method of ['GET', 'HEAD', 'PUT', 'DELETE', 'PATCH']) {
+    const metadata = new RepresentationMetadata(TARGET);
+    metadata.add(namedNode(cookiePredicate), HANDLE);
+    const other = { method, target: TARGET, json: { state: 's-method', code: 'c' }, metadata } as never;
+
+    await assert.rejects(handler.handleSafe(other), isMethodNotAllowed, `${method} was not refused`);
+    await assert.rejects(handler.login(other), isMethodNotAllowed, `${method} was not refused`);
+    // The login it named is untouched, so the browser that started it can
+    // still finish it.
+    assert.ok(await store.peek('s-method'), `a ${method} spent the login`);
+  }
+
+  const { json } = await handler.login(callback({ state: 's-method', code: 'c' }));
+  assert.equal(json.accountId, 'acc-1');
 });

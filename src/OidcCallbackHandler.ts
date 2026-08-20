@@ -1,7 +1,9 @@
 import { timingSafeEqual } from 'node:crypto';
 import { DataFactory, Parser, Store } from 'n3';
 import type { Term } from 'n3';
-import { ResolveLoginHandler, BadRequestHttpError, RepresentationMetadata } from '@solid/community-server';
+import {
+  ResolveLoginHandler, BadRequestHttpError, HttpError, RepresentationMetadata,
+} from '@solid/community-server';
 import type {
   AccountStore, CookieStore, JsonInteractionHandlerInput,
   JsonRepresentation, LoginOutputType,
@@ -56,6 +58,22 @@ export interface OidcCallbackHandlerArgs {
   trustPredicate?: string;
 }
 
+/**
+ * A token exchange that never gets an answer out of the provider went wrong
+ * somewhere the caller has no part in: the endpoint is the one discovery
+ * named, and the request carries this server's own credentials. Reporting that
+ * as a bad request blames a browser for a host being down, and buries the one
+ * failure an operator can act on among the many that are genuinely the
+ * caller's. So it is reported as the provider's — 502 for a provider that
+ * answered in a way that is no answer at all, and 504 for one that did not
+ * answer inside the deadline, which is the case an operator can tell apart at
+ * a glance. What the provider does say about the code, verifier and redirect
+ * URI presented to it stays a 400: that is a verdict on the callback this
+ * caller brought.
+ */
+const providerFailed = (message: string): HttpError => new HttpError(502, 'BadGatewayHttpError', message);
+const providerTimedOut = (message: string): HttpError => new HttpError(504, 'GatewayTimeoutHttpError', message);
+
 /** Compares two secrets without leaking where they first differ. */
 const secretsMatch = (left: string, right: string): boolean => {
   const a = Buffer.from(left, 'utf8');
@@ -71,10 +89,6 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
   public constructor(args: OidcCallbackHandlerArgs) {
     super(args.accountStore, args.cookieStore);
     this.args = args;
-  }
-
-  public async canHandle({ method }: JsonInteractionHandlerInput): Promise<void> {
-    assertPostOnly(method);
   }
 
   public async login(
@@ -177,12 +191,12 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
     } catch (error) {
       const name = (error as { name?: string }).name;
       if (name === 'TimeoutError' || name === 'AbortError') {
-        throw new BadRequestHttpError(`The token endpoint did not answer within ${RESPONSE_TIMEOUT_MS}ms.`);
+        throw providerTimedOut(`The token endpoint did not answer within ${RESPONSE_TIMEOUT_MS}ms.`);
       }
-      throw new BadRequestHttpError('The token endpoint could not be reached.');
+      throw providerFailed('The token endpoint could not be reached.');
     }
     if (response.status >= 300 && response.status < 400) {
-      throw new BadRequestHttpError(
+      throw providerFailed(
         'The token endpoint redirects elsewhere; the exchange has to happen at the endpoint discovery named.',
       );
     }
@@ -192,7 +206,7 @@ export class OidcCallbackHandler extends ResolveLoginHandler {
 
     const body = this.parseTokenResponse(await readCapped(
       response,
-      (): Error => new BadRequestHttpError(`The token response is larger than ${RESPONSE_MAX_BYTES} bytes.`),
+      (): Error => providerFailed(`The token response is larger than ${RESPONSE_MAX_BYTES} bytes.`),
     ));
     if (!body.id_token) {
       throw new BadRequestHttpError('Token response carried no ID token.');
