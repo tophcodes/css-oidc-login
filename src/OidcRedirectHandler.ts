@@ -14,8 +14,7 @@ export interface OidcRedirectHandlerArgs {
   scopes?: string;
 }
 
-const base64url = (buf: Buffer): string =>
-  buf.toString('base64').replace(/\+/gu, '-').replace(/\//gu, '_').replace(/=/gu, '');
+const base64url = (buf: Buffer): string => buf.toString('base64url');
 
 export class OidcRedirectHandler extends JsonInteractionHandler {
   private readonly args: OidcRedirectHandlerArgs;

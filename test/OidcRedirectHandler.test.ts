@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { OidcRedirectHandler } from '../src/OidcRedirectHandler.ts';
 import { PendingLoginStore } from '../src/PendingLoginStore.ts';
 
@@ -29,11 +30,16 @@ test('builds an authorization URL with PKCE and the configured scopes', async ()
   assert.equal(url.searchParams.get('redirect_uri'), 'https://pod.example/.account/login/oidc/callback/');
   assert.equal(url.searchParams.get('scope'), 'openid profile');
   assert.equal(url.searchParams.get('code_challenge_method'), 'S256');
-  assert.ok(url.searchParams.get('code_challenge'));
+
+  // Read the verifier once (consume is single-use) and reuse it for both checks below.
+  const state = url.searchParams.get('state') as string;
+  const pending = await store.consume(state);
+  assert.ok(pending);
+
+  const expectedChallenge = createHash('sha256').update(pending.codeVerifier).digest('base64url');
+  assert.equal(url.searchParams.get('code_challenge'), expectedChallenge);
 
   // The state must be redeemable exactly once.
-  const state = url.searchParams.get('state') as string;
-  assert.ok(await store.consume(state));
   assert.equal(await store.consume(state), undefined);
 });
 
