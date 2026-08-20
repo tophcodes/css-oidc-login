@@ -197,3 +197,40 @@ test('gives up on an issuer that stops mid-document', { timeout: BEYOND_PATIENCE
     );
   });
 });
+
+// An endpoint that is a string but no URL is a document that cannot be acted
+// on, and the authorization one is handed straight to `new URL` where the
+// login is built — unchecked here it surfaces there as an unclassified fault
+// of this server for a document the provider wrote.
+test('refuses a document whose endpoints are not URLs', async () => {
+  for (const endpoint of [ 'authorization_endpoint', 'token_endpoint' ]) {
+    const impl = (async () =>
+      new Response(document({ [endpoint]: 'not a url' }), { status: 200 })
+    ) as unknown as typeof fetch;
+
+    await withFetch(impl, async () => {
+      const discovery = new OidcDiscovery('https://idp.example');
+      await assert.rejects(discovery.endpoints(), (error: unknown): boolean => {
+        assert.equal(statusOf(error), 502, `a ${endpoint} that is no URL was reported as ${statusOf(error)}`);
+        assert.match(String(error), new RegExp(`${endpoint} that is not an absolute URL`, 'u'));
+        return true;
+      });
+    });
+  }
+});
+
+// The issuer is configuration. An issuer that is no URL is this deployment's
+// own failure, and left to `new URL` it is a fault that names neither the
+// setting nor its value.
+test('reports a configured issuer that is no URL as this server\'s own', async () => {
+  const impl = (async () => new Response(document(), { status: 200 })) as unknown as typeof fetch;
+
+  await withFetch(impl, async () => {
+    const discovery = new OidcDiscovery('not an issuer');
+    await assert.rejects(discovery.endpoints(), (error: unknown): boolean => {
+      assert.equal(statusOf(error), 500, `a configured issuer that is no URL was reported as ${statusOf(error)}`);
+      assert.match(String(error), /configured issuer not an issuer is not an absolute URL/u);
+      return true;
+    });
+  });
+});

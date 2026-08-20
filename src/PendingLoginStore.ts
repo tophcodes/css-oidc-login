@@ -255,7 +255,16 @@ export class PendingLoginStore {
    * broken than that their deployment is.
    */
   private assertSecureCallback(callbackUrl: string): void {
-    if (new URL(callbackUrl).protocol !== 'https:') {
+    let url: URL;
+    try {
+      url = new URL(callbackUrl);
+    } catch {
+      throw new InternalServerError(
+        `The configured callback URL ${callbackUrl} is not an absolute URL, so this server cannot ` +
+        `write the pending-login cookie ${this.cookieName} for it.`,
+      );
+    }
+    if (url.protocol !== 'https:') {
       throw new InternalServerError(
         `The pending-login cookie ${this.cookieName} is only stored by a browser over HTTPS, ` +
         `but the callback URL ${callbackUrl} is not. ` +

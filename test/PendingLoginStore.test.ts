@@ -47,6 +47,24 @@ test('carries the __Host- prefix whether or not the configured name does', async
   assert.equal(new PendingLoginStore(600000, '__Host-named').cookieName, '__Host-named');
 });
 
+// A callback URL that is no URL at all is the same misconfiguration one step
+// earlier, and left to `new URL` it reaches the client as a fault that names
+// neither the setting nor its value.
+test('refuses to serialise a cookie for a callback that is no URL', async () => {
+  const store = new PendingLoginStore();
+  for (const callbackUrl of [ 'not a url', '/relative/cb', '' ]) {
+    assert.throws(
+      () => store.cookie('h', callbackUrl),
+      (error: unknown): boolean => {
+        assert.equal((error as { statusCode?: number }).statusCode, 500);
+        assert.match(String(error), /is not an absolute URL/u);
+        return true;
+      },
+      `${callbackUrl} was not refused`,
+    );
+  }
+});
+
 test('refuses to serialise a cookie for a callback that is not HTTPS', async () => {
   const store = new PendingLoginStore();
   assert.throws(
