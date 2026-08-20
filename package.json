@@ -1,0 +1,27 @@
+{
+  "name": "css-oidc-login",
+  "version": "0.1.0",
+  "description": "Log in to a Community Solid Server with an external OpenID Connect provider",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "lsd:module": true,
+  "lsd:basePath": "dist/",
+  "scripts": {
+    "build": "tsc && componentsjs-generator -s dist -c dist/components -i .componentsignore -r co",
+    "test": "node --test --experimental-strip-types test/**/*.test.ts"
+  },
+  "dependencies": {
+    "n3": "^1.17.1"
+  },
+  "peerDependencies": {
+    "@solid/community-server": "^7.2.0"
+  },
+  "devDependencies": {
+    "@solid/community-server": "^7.2.0",
+    "componentsjs-generator": "^4.2.0",
+    "typescript": "^5.6.3"
+  }
+}
