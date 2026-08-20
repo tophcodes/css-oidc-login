@@ -215,3 +215,23 @@ test('keeps the store reclaimable when a state is written again', async () => {
   assert.ok(await store.peek('first'), 'the login that was written again was dropped instead');
   assert.equal(await store.peek('second'), undefined);
 });
+
+// The cap turns away what is new to the store, not a login already in it: a
+// state written again is one that already holds its room, and a store with
+// none left has none to give it either way. Refused there, a browser that
+// starts the same login twice would lose the one it had, and the entry is
+// taken out to be rewritten by the time the refusal would happen.
+test('renews a login it already holds even when there is no room left', async () => {
+  const store = new PendingLoginStore(600000, 'pending', 2);
+  await store.create('held-1', { codeVerifier: 'v1', handle: 'h1' });
+  await store.create('held-2', { codeVerifier: 'v2', handle: 'h2' });
+
+  await store.create('held-1', { codeVerifier: 'v1-again', handle: 'h1-again' });
+
+  assert.deepEqual(
+    await store.peek('held-1'),
+    { codeVerifier: 'v1-again', handle: 'h1-again' },
+    'the login that was written again was refused by the cap it already fits under',
+  );
+  assert.ok(await store.peek('held-2'), 'the other login in progress was dropped');
+});

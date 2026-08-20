@@ -124,17 +124,15 @@ export class PendingLoginStore {
    */
   public async create(state: string, data: PendingLogin): Promise<void> {
     this.reclaim();
-    // A state already in the store gets a later expiry, so it has to leave its
-    // place rather than keep it: {@link reclaim} stops at the first entry that
-    // is still live, which reclaims everything expired only while the order
-    // entries sit in is the order they expire in. Taking it out and putting it
-    // back is what holds the two in the same order by construction rather than
-    // by nobody ever asking twice. Room it already occupies is room it keeps,
-    // so a store with none left refuses only what is new to it — anything else
-    // would let whoever learns a state, which travels through the provider,
-    // end that login by asking for it again while the store is full.
-    const held = this.pending.delete(state);
-    if (!held && this.pending.size >= this.maxPending) {
+    // Room a state already holds is room it keeps: the cap decides what may
+    // come into the store, and a state already in it is not coming in. Every
+    // login is written under a state generated for it alone, so a state
+    // written twice is one login being renewed rather than one login naming
+    // another's, and a renewal takes no room that the login was not already
+    // occupying. Asked before the entry is taken out, because from there on
+    // there is nothing left to keep and a refusal would drop the very login it
+    // was about to renew.
+    if (!this.pending.has(state) && this.pending.size >= this.maxPending) {
       // How full the store is, and therefore what a flood costs and when the
       // next one lands, is measurable by anyone who is told the number, and
       // nothing authenticates the route that fills it. The operator is the one
@@ -142,6 +140,13 @@ export class PendingLoginStore {
       this.logger.warn(`Refusing a login: ${this.maxPending} logins are already in progress.`);
       throw this.outOfRoom();
     }
+    // A state already in the store gets a later expiry, so it has to leave its
+    // place rather than keep it: {@link reclaim} stops at the first entry that
+    // is still live, which reclaims everything expired only while the order
+    // entries sit in is the order they expire in. Taking it out and putting it
+    // back is what holds the two in the same order by construction rather than
+    // by nobody ever asking twice.
+    this.pending.delete(state);
     this.pending.set(state, { data, expires: Date.now() + this.ttlMs });
   }
 
