@@ -1,32 +1,39 @@
 <!doctype html>
-<html lang="en">
+<html lang="en"
+      prefix="rdf: http://www.w3.org/1999/02/22-rdf-syntax-ns#
+              rdfs: http://www.w3.org/2000/01/rdf-schema#
+              owl: http://www.w3.org/2002/07/owl#
+              xsd: http://www.w3.org/2001/XMLSchema#
+              login: https://tophcodes.github.io/css-oidc-login/ns#">
 <head>
 <meta charset="utf-8">
 <title>css-oidc-login vocabulary</title>
-<link rel="alternate" type="text/turtle" href="ns.ttl">
 <style>
   body { font-family: system-ui, sans-serif; max-width: 46rem; margin: 3rem auto; padding: 0 1rem; line-height: 1.6; color: #222; }
   code { background: #f4f4f4; padding: 0.1em 0.3em; border-radius: 3px; font-size: 0.95em; }
   pre { background: #f4f4f4; padding: 1rem; border-radius: 4px; overflow-x: auto; }
   h2 { margin-top: 2.5rem; font-size: 1.15rem; }
-  dt { font-weight: 600; margin-top: 1rem; }
-  dd { margin: 0.3rem 0 0 1.5rem; }
-  .iri { color: #555; font-size: 0.9em; word-break: break-all; }
+  section { margin-top: 1.8rem; }
+  h3 { margin-bottom: 0.2rem; font-size: 1rem; }
+  .iri { color: #555; font-size: 0.9em; word-break: break-all; margin: 0 0 0.4rem; }
 </style>
 </head>
 <body>
 
-<h1>css-oidc-login vocabulary</h1>
+<div about="https://tophcodes.github.io/css-oidc-login/ns" typeof="owl:Ontology">
 
-<p>Three terms used by
-<a href="https://github.com/tophcodes/css-oidc-login">css-oidc-login</a>, a login
-method for the Community Solid Server that authenticates people against an
-external OpenID Connect provider.</p>
+<h1 property="rdfs:label">css-oidc-login vocabulary</h1>
 
-<p>A WebID profile uses them to state that its owner accepts being authenticated
-by one particular subject at one particular provider. Both halves sit in a
-single grant node: an issuer alone grants nothing, and neither does a subject.
-Removing the node revokes external login for that person and nobody else.</p>
+<p property="rdfs:comment">Terms a WebID profile uses to accept authentication by
+one subject at one external OpenID Connect provider.</p>
+
+<p>Used by <a property="rdfs:seeAlso" href="https://github.com/tophcodes/css-oidc-login">css-oidc-login</a>,
+a login method for the Community Solid Server that authenticates people against
+an external OpenID Connect provider.</p>
+
+<p>A profile states the acceptance in a single grant node: an issuer alone
+grants nothing, and neither does a subject identifier. Removing the node revokes
+external login for that person and nobody else.</p>
 
 <pre>&lt;https://pod.example.com/alice/profile/card#me&gt;
   &lt;https://tophcodes.github.io/css-oidc-login/ns#externalLogin&gt; [
@@ -36,26 +43,35 @@ Removing the node revokes external login for that person and nobody else.</p>
 
 <h2>Terms</h2>
 
-<dl>
-  <dt id="externalLogin">externalLogin</dt>
-  <dd class="iri">https://tophcodes.github.io/css-oidc-login/ns#externalLogin</dd>
-  <dd>Relates a WebID to a grant node. The subject is the person's own WebID;
-  the object is a node carrying exactly one issuer and one subject identifier.
-  A profile may carry several, one per provider.</dd>
+<section about="login:externalLogin" typeof="rdf:Property">
+  <h3 id="externalLogin" property="rdfs:label">external login</h3>
+  <p class="iri">https://tophcodes.github.io/css-oidc-login/ns#externalLogin</p>
+  <p property="rdfs:comment">Relates a WebID to a grant node carrying one issuer
+  and one subject identifier. The statement's subject is the person's own WebID.
+  A profile may carry several grants, one per provider.</p>
+  <link property="rdfs:isDefinedBy" href="https://tophcodes.github.io/css-oidc-login/ns">
+</section>
 
-  <dt id="issuer">issuer</dt>
-  <dd class="iri">https://tophcodes.github.io/css-oidc-login/ns#issuer</dd>
-  <dd>The issuer identifier of the OpenID Connect provider the grant applies to,
-  as an IRI. Compared against the <code>iss</code> claim of the ID token,
-  ignoring a trailing slash. A literal here does not count.</dd>
+<section about="login:issuer" typeof="rdf:Property">
+  <h3 id="issuer" property="rdfs:label">issuer</h3>
+  <p class="iri">https://tophcodes.github.io/css-oidc-login/ns#issuer</p>
+  <p property="rdfs:comment">The issuer identifier of the provider a grant
+  applies to, as an IRI. Compared against the token's iss claim, ignoring a
+  trailing slash. A literal does not satisfy it.</p>
+  <link property="rdfs:domain" href="https://tophcodes.github.io/css-oidc-login/ns#externalLogin">
+  <link property="rdfs:isDefinedBy" href="https://tophcodes.github.io/css-oidc-login/ns">
+</section>
 
-  <dt id="subject">subject</dt>
-  <dd class="iri">https://tophcodes.github.io/css-oidc-login/ns#subject</dd>
-  <dd>The subject identifier that provider assigns to this person, as a literal.
-  Compared exactly against the <code>sub</code> claim. This is what makes the
-  grant name a person rather than a provider: without it, anyone able to obtain
-  a token from the same issuer would inherit the grant.</dd>
-</dl>
+<section about="login:subject" typeof="rdf:Property">
+  <h3 id="subject" property="rdfs:label">subject identifier</h3>
+  <p class="iri">https://tophcodes.github.io/css-oidc-login/ns#subject</p>
+  <p property="rdfs:comment">The subject identifier the provider assigns to this
+  person, as a literal. Compared exactly against the token's sub claim. This is
+  what makes a grant name a person rather than a provider: without it, anyone
+  able to obtain a token from the same issuer would inherit the grant.</p>
+  <link property="rdfs:range" href="http://www.w3.org/2001/XMLSchema#string">
+  <link property="rdfs:isDefinedBy" href="https://tophcodes.github.io/css-oidc-login/ns">
+</section>
 
 <h2>Notes</h2>
 
@@ -64,12 +80,12 @@ dereferences them, so this page is documentation rather than something the
 software fetches. A deployment preferring its own vocabulary can configure a
 different predicate for the first term; the two inside the grant node are fixed.</p>
 
-<p>The grant must be in the profile's default graph, with the person's own WebID
-as subject. A statement about somebody else, one parked in a named graph, or an
-issuer written as a quoted string are each refused — they place the issuer's
-name near the WebID without asserting anything about it.</p>
+<p>The grant must sit in the profile's default graph, with the person's own
+WebID as subject. A statement about somebody else, one parked in a named graph,
+and an issuer written as a quoted string are each refused — they place the
+issuer's name near the WebID without asserting anything about it.</p>
 
-<p>Also available as <a href="ns.ttl">Turtle</a>.</p>
+</div>
 
 </body>
 </html>
