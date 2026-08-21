@@ -2,6 +2,16 @@
 
 The settings named here — `callbackUrl`, `issuer`, `clientId`, `clientSecret` and `scopes` — are the ones in [Configuration](./configuration.md#settings).
 
+## The callback URL
+
+Every provider needs the configured `callbackUrl` registered as the client's callback URL, and compares the two character for character. The URL follows from where the routes are mounted — the start route with `callback/` beneath it — and the trailing slash is part of it:
+
+```
+https://pod.example.com/.account/login/oidc/callback/
+```
+
+A registered value differing in the trailing slash, the scheme, the host or the case of the path is refused at the provider, before a login screen appears and before this server is reached at all, so nothing is logged here. Pocket ID answers *Invalid callback URL, it might be necessary for an admin to fix this*; Keycloak answers *Invalid parameter: redirect_uri*.
+
 ## Pocket ID
 
 [Pocket ID](https://pocket-id.org/) is passkey-only, which suits a pod that should have no password anywhere. It has no notion of a WebID, so the WebID travels in a custom claim.

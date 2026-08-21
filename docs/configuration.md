@@ -159,7 +159,7 @@ The entry reusing `urn:solid-server:default:LoginHandler` is what makes the meth
 
 **The two routes** are ordinary account-API routes, so their URLs follow from where the configuration hangs them: as written, `/.account/login/oidc/` under the server's login route, where the login-method list lives, and `/.account/login/oidc/callback/` beneath it. Any other path works as long as `callbackUrl` agrees. Both answer only POST and refuse anything else with a 405.
 
-**`callbackUrl`** is the absolute URL the callback route resolves to. It appears twice on purpose — sent as `redirect_uri` in the authorization request and again in the token exchange, which the provider compares — and must be registered at the provider verbatim, trailing slash included. It must be `https:`.
+**`callbackUrl`** is the absolute URL the callback route resolves to, and follows from where the routes are mounted: the start route's path with `callback/` beneath it. Mounted as in the example above, that is `https://pod.example.com/.account/login/oidc/callback/`, and the trailing slash is part of the URL. It appears twice on purpose — sent as `redirect_uri` in the authorization request and again in the token exchange, which the provider compares — and must be registered at the provider character for character; [the callback URL](./providers.md#the-callback-url) shows what a mismatch looks like. It must be `https:`.
 
 **`scopes`** defaults to `openid profile`. Keep `profile` unless the provider is known not to need it: see the [Pocket ID notes](./providers.md#pocket-id), where dropping it silently costs the WebID claim.
 
