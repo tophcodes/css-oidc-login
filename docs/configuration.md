@@ -1,0 +1,248 @@
+# Configuration
+
+Everything here assumes the hard requirements in [Before you deploy](./security.md#before-you-deploy) are met: HTTPS on both sides, an account that already exists with its WebID already linked, a single worker, and a profile document that can carry a grant. Read those first.
+
+The Community Solid Server assembles itself at startup from JSON configuration read by [Components.js](https://componentsjs.readthedocs.io/): each object in the graph names a class and the arguments its constructor gets, under an identifier. Your own configuration file imports the server's stock configuration and then adds objects of its own — and where it reuses an identifier the stock configuration already defines, the values it supplies are added to the ones already there. That is how the entries below hang new handlers, controls, templates and cookie mappings off components the server has already built, without copying the stock configuration.
+
+This package ships the Components.js metadata that lets a configuration name its classes, so everything is wired in a file. The following is a complete setup on top of the stock config:
+
+```json
+{
+  "@context": [
+    "https://linkedsoftwaredependencies.org/bundles/npm/@solid/community-server/^7.0.0/components/context.jsonld",
+    "https://linkedsoftwaredependencies.org/bundles/npm/css-oidc-login/^0.0.0/components/context.jsonld"
+  ],
+  "import": [ "css:config/default.json" ],
+  "@graph": [
+    {
+      "@id": "urn:css-oidc-login:default:PendingLoginStore",
+      "@type": "PendingLoginStore",
+      "ttlMs": 600000
+    },
+    {
+      "@id": "urn:css-oidc-login:default:Discovery",
+      "@type": "OidcDiscovery",
+      "issuer": "https://id.example.com"
+    },
+
+    {
+      "@id": "urn:css-oidc-login:default:StartRouter",
+      "@type": "InteractionRouteHandler",
+      "route": {
+        "@id": "urn:css-oidc-login:default:StartRoute",
+        "@type": "RelativePathInteractionRoute",
+        "base": { "@id": "urn:solid-server:default:LoginRoute" },
+        "relativePath": "oidc/"
+      },
+      "source": {
+        "@type": "OidcRedirectHandler",
+        "store": { "@id": "urn:css-oidc-login:default:PendingLoginStore" },
+        "discovery": { "@id": "urn:css-oidc-login:default:Discovery" },
+        "clientId": "solid-pod",
+        "callbackUrl": "https://pod.example.com/.account/login/oidc/callback/",
+        "scopes": "openid profile"
+      }
+    },
+    {
+      "@id": "urn:css-oidc-login:default:CallbackRouter",
+      "@type": "InteractionRouteHandler",
+      "route": {
+        "@id": "urn:css-oidc-login:default:CallbackRoute",
+        "@type": "RelativePathInteractionRoute",
+        "base": { "@id": "urn:css-oidc-login:default:StartRoute" },
+        "relativePath": "callback/"
+      },
+      "source": {
+        "@type": "OidcCallbackHandler",
+        "accountStore": { "@id": "urn:solid-server:default:AccountStore" },
+        "cookieStore": { "@id": "urn:solid-server:default:CookieStore" },
+        "store": { "@id": "urn:css-oidc-login:default:PendingLoginStore" },
+        "storage": { "@id": "urn:solid-server:default:AccountStorage" },
+        "discovery": { "@id": "urn:css-oidc-login:default:Discovery" },
+        "issuer": "https://id.example.com",
+        "clientId": "solid-pod",
+        "clientSecret": "the-client-secret",
+        "callbackUrl": "https://pod.example.com/.account/login/oidc/callback/",
+        "webIdClaim": "webid"
+      }
+    },
+
+    {
+      "@id": "urn:solid-server:default:CookieParser",
+      "@type": "CookieParser",
+      "cookieMap": [{
+        "CookieParser:_cookieMap_key": "__Host-css-oidc-login-pending",
+        "CookieParser:_cookieMap_value": "urn:css-oidc-login:http:pendingLoginCookie"
+      }]
+    },
+    {
+      "@id": "urn:solid-server:default:MetadataWriter_Mapped",
+      "@type": "MappedMetadataWriter",
+      "headerMap": [{
+        "MappedMetadataWriter:_headerMap_key": "urn:css-oidc-login:http:setPendingLoginCookie",
+        "MappedMetadataWriter:_headerMap_value": "Set-Cookie"
+      }, {
+        "MappedMetadataWriter:_headerMap_key": "urn:css-oidc-login:http:retryAfter",
+        "MappedMetadataWriter:_headerMap_value": "Retry-After"
+      }]
+    },
+
+    {
+      "@id": "urn:solid-server:default:InteractionRouteHandler",
+      "@type": "WaterfallHandler",
+      "handlers": [
+        { "@id": "urn:css-oidc-login:default:StartRouter" },
+        { "@id": "urn:css-oidc-login:default:CallbackRouter" }
+      ]
+    },
+    {
+      "@id": "urn:solid-server:default:LoginHandler",
+      "@type": "ControlHandler",
+      "controls": [{
+        "ControlHandler:_controls_key": "External OpenID Connect provider",
+        "ControlHandler:_controls_value": { "@id": "urn:css-oidc-login:default:StartRoute" }
+      }]
+    },
+    {
+      "@id": "urn:solid-server:default:HtmlViewHandler",
+      "@type": "HtmlViewHandler",
+      "templates": [
+        {
+          "@id": "urn:css-oidc-login:default:StartHtml",
+          "@type": "HtmlViewEntry",
+          "filePath": "/etc/css/templates/oidc-start.html.ejs",
+          "route": { "@id": "urn:css-oidc-login:default:StartRoute" }
+        },
+        {
+          "@id": "urn:css-oidc-login:default:CallbackHtml",
+          "@type": "HtmlViewEntry",
+          "filePath": "/etc/css/templates/oidc-callback.html.ejs",
+          "route": { "@id": "urn:css-oidc-login:default:CallbackRoute" }
+        }
+      ]
+    }
+  ]
+}
+```
+
+## The cookie wiring is not optional
+
+The two entries reusing `urn:solid-server:default:CookieParser` and `urn:solid-server:default:MetadataWriter_Mapped` are what carry the pending-login cookie in and out. Without the parser entry the handle never reaches the callback handler; without the writer entry the cookie is never set in the first place. Either omission makes every login fail, with the callback refusing because it carried no cookie. That is by design — the failure is loud and total rather than a deployment that silently runs without the protection — but it does mean a configuration that names only the two handlers cannot log anyone in.
+
+The `Set-Cookie` value is serialised by this package and handed to the server's generic predicate-to-header writer, which is already wired in the stock configuration. **Do not route it through the server's cookie writer instead.** `CookieMetadataWriter` builds the attributes itself and hardcodes `SameSite=Lax` and `Path=/`, with no way to override either, and sets neither `HttpOnly` nor `Secure`. `SameSite=Strict` is the attribute that makes the cross-site form submission fail, and it is the reason this cookie exists; the substitution would look like it worked and would reopen the login-CSRF hole in silence.
+
+The second `headerMap` entry is not in that class. `urn:css-oidc-login:http:retryAfter` carries the `Retry-After` of a login refused because the store is full; left unmapped, the refusal still happens and the caller is simply not told when to come back. It costs a header, not a login.
+
+The store's `cookieName` is the single field deciding both what is written and what has to be mapped, so a deployment can rename the cookie in one place. One wrinkle: the store applies the `__Host-` prefix itself, so a configured name of `pod-pending-login` produces the cookie `__Host-pod-pending-login`, and that prefixed form is what the cookie-parser entry has to name.
+
+## The rest of it
+
+**The pending-login store** holds the logins in progress: for each, the PKCE code verifier and the opaque handle that belongs to the browser that started it, keyed by the state sent to the provider. It also owns the cookie's name and serialisation, and the three metadata predicates above. Both handlers must be given the *same* instance — if each gets its own, the callback never finds the login that started, and no login can succeed. `ttlMs` is how long a person may take between arriving at the provider and coming back, and is also the cookie's lifetime; it defaults to ten minutes, which is generous for a passkey and tight enough that an abandoned attempt does not stay redeemable all day. `maxPending` is the most logins that may be in progress at once, ten thousand by default; past it a login is refused with the 503 described in [Before you deploy](./security.md#before-you-deploy) rather than an existing one being evicted for it.
+
+**The discovery object** takes the provider's issuer identifier and reads `authorization_endpoint` and `token_endpoint` from `<issuer>/.well-known/openid-configuration`. It refuses to follow a redirect away from the issuer, refuses a document that is not a JSON object, refuses one whose own `issuer` field names a different provider — every later check hangs off what this document says, so a document from elsewhere would be a document about somebody else — and refuses one whose `authorization_endpoint` or `token_endpoint` is not an absolute `https:` URL. The fetch gives up after five seconds and stops reading past a megabyte. It is fetched once and the answer is cached for the life of the process, so a provider that moves its endpoints needs a restart here. Share one instance, as above; two would only mean two fetches of the same document.
+
+**The two routes** are ordinary account-API routes, so their URLs follow from where you hang them. As written, the start route is `/.account/login/oidc/` — under the server's login route, which is where the login-method list lives — and the callback is `/.account/login/oidc/callback/` beneath it. Any other path works as long as `callbackUrl` agrees with it. Both answer only POST, and refuse anything else with a 405: each of them acts — one hands out a cookie, the other spends it — so neither has a safe reading. The two pages below and the direct-client walkthrough already post to both.
+
+**`callbackUrl`** must be the absolute URL the callback route resolves to, and it appears twice on purpose: it is sent as `redirect_uri` in the authorization request and again in the token exchange, and the provider compares the two. Register it at the provider verbatim, trailing slash included. It must be `https:`, as described in [Before you deploy](./security.md#before-you-deploy).
+
+**`scopes`** defaults to `openid profile`. Keep `profile` unless you are certain your provider does not need it — see the [Pocket ID notes](./providers.md#pocket-id-webid-in-a-custom-claim), where dropping it silently costs you the WebID claim.
+
+**`clientId` and `clientSecret`** identify a confidential client at the provider. The token exchange sends both in the request body, so the provider must accept `client_secret_post`; both providers in [the walkthroughs](./providers.md) do.
+
+**`issuer`** on the callback handler is what an ID token's `iss` claim is compared against. It is stated separately from the discovery object rather than derived from it, because these are two different assertions: one is where to go asking, the other is whose tokens are acceptable. The discovery object's `issuer` has to be an absolute `https:` URL, as described in [Before you deploy](./security.md#before-you-deploy); this one is only ever compared as a string, so write the two identically.
+
+**`accountStore` and `cookieStore`** are the server's own, and are what turn a successful check into a session cookie. **`storage`** is the indexed storage the server keeps its WebID links in; the handler reads it to resolve a WebID to an account and never writes to it.
+
+**`webIdClaim`** names the claim the WebID is read from, defaulting to `webid` — the claim Solid-OIDC itself defines, which some providers already emit. Anything else, and you name it here.
+
+**`trustPredicate`** is optional and defaults to the term the grant uses, described in [Why the predicate is not `solid:oidcIssuer`](./security.md#why-the-predicate-is-not-solidoidcissuer). Set it only if you want a term of your own; once set, the default term is no longer accepted. A value has to be an absolute IRI: a scheme, and after it only what a Turtle document could carry inside one — no space, no control character, none of `<>"{}|^`, no backtick and no backslash. Any scheme will do, since the predicate is compared as a string and never dereferenced. Anything else could never appear as a predicate in a parsed profile, so it would match every profile alike — not at all — and every login would end as a refusal blaming a person for a grant they did write. It is refused where it is configured instead: the handler will not be constructed, so the server stops at startup with a 500 naming the setting and its value, *The configured trust predicate <value> is not an absolute IRI, so no profile can carry a grant under it and every login would be refused as if its owner had granted nothing.*
+
+## Where the client secret belongs
+
+The example above has the secret inline, which is fine for reading and wrong for deploying. Components.js reads this file at startup, so whatever the value is, it lives in a file on disk that the server user can read: at minimum, keep it out of the repository that holds the rest of your configuration, and give it file permissions that match its contents.
+
+The server does have a mechanism for values supplied at startup — its own command-line parameters are declared as variables and can be filled from `CSS_`-prefixed environment variables — but the set of those parameters is itself configuration. Extending it to a parameter of your own means declaring a variable, adding an option to the server's CLI extractor and a resolver entry for it, and then referencing the variable here. That mechanism exists; this package does not ship it, and neither the package nor this document has been exercised that way.
+
+## The two pages the browser needs
+
+The account API takes its input from JSON request bodies, and the stock request parsing strips the query string before a request reaches a handler. The provider, though, sends the person back with `?code=…&state=…` in the URL. Something has to bridge that, and this package deliberately ships no HTML: templates are yours to style, and the server already has a mechanism for registering them.
+
+The two files referenced from the configuration above are ordinary server templates, rendered inside the server's page frame, which already loads the helper script used below.
+
+`oidc-start.html.ejs` asks its own URL for the authorization URL and sends the person on:
+
+```html
+<h1>Redirecting to the external provider</h1>
+<p class="error" id="error"></p>
+<script>
+  (async() => {
+    try {
+      const response = await postJson('', {});
+      const body = await response.json();
+      if (body.location) {
+        location.href = body.location;
+      } else {
+        setError(body.message ?? 'The server returned no location.');
+      }
+    } catch (error) {
+      setError(error.message);
+    }
+  })();
+</script>
+```
+
+`oidc-callback.html.ejs` turns the provider's query parameters into the JSON body the callback handler reads:
+
+```html
+<h1>Completing the login</h1>
+<p class="error" id="error"></p>
+<script>
+  (async() => {
+    const params = new URLSearchParams(location.search);
+    try {
+      const response = await postJson('', { state: params.get('state'), code: params.get('code') });
+      const body = await response.json();
+      if (response.status >= 400) {
+        setError(body.message);
+      } else {
+        location.href = body.location ?? '<%= idpIndex %>';
+      }
+    } catch (error) {
+      setError(error.message);
+    }
+  })();
+</script>
+```
+
+That the callback page posts to the server rather than letting the provider's redirect do the work is load-bearing. The navigation back from the provider is a cross-site one, and a `SameSite=Strict` cookie is not sent with it; the request the page then makes to its own origin is same-site, and carries the cookie. A callback handled by anything other than a same-origin request from a page on this server will not find one.
+
+The `location` field in the successful response appears when the login happened inside an active Solid authorization request — the usual case, where a Solid app sent the person here to log in. It points at the place that flow resumes. Without it, there is nothing left to do but go back to the account page.
+
+A client that speaks the account API directly needs neither page, but does need a cookie jar: POST to the start route, keep the `Set-Cookie` from that response, follow the `location` you got back, POST `{"state":…,"code":…}` to the callback route **with that cookie**, and use the `authorization` value from the response as the session credential. A client that discards the cookie is refused, exactly as a browser without one would be.
+
+## Installing, building, testing
+
+**The package targets Community Solid Server 7.x**, which it declares as a peer dependency, and it is developed against 7.2.
+
+**It is not on npm.** Install it from a checkout — a `file:` dependency, `npm link`, or a copy into the server's `node_modules` — and build it first, since what a server loads is the compiled `dist/` directory, which also carries the metadata that lets a configuration name these classes:
+
+```bash
+npm install
+npm run build
+```
+
+The build compiles `src/` with `tsc` and then generates the component descriptions into `dist/components/`. The `@context` URL in your configuration must match the one that generation stamps into `dist/components/context.jsonld`; it tracks the package's major version, which is why a 0.x release is `^0.0.0`.
+
+Components.js discovers the package by scanning `node_modules` from the module path the server was started with, so nothing needs registering by hand once it is installed there.
+
+**In a container**, that scan is the whole story. The published server image contains the server and its own dependencies and nothing else, so a third-party handler means an image built on top of it: install this package where Components.js will find it, and add your configuration file and the two templates. Neither a Dockerfile nor a tested recipe for that ships here, and the author has not run it in a container — if you deploy that way, expect to work out the layout yourself, and confirm afterwards that the new entry actually appears in the server's list of login methods.
+
+Tests are Node's own runner over the TypeScript sources, with no test framework:
+
+```bash
+npm test
+```
+
+That needs Node 22.7 or newer, for the type stripping that lets `node --test` read `.ts` files directly. 22.6 is the release that accepts the flag, but its stripper does not erase accessibility modifiers, and every class here declares a `public constructor` — so the suite dies on the first source file it loads rather than failing a test.
+
+Both floors are declared in the manifest and both are checked by the suite itself: `engines` says Node 18 or newer, which is what the published `dist/` needs and all it needs, and `devEngines` says 22.7 or newer, which is what running the tests from source needs.
