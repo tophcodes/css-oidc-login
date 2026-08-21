@@ -1,8 +1,13 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "module": "NodeNext",
-    "moduleResolution": "NodeNext",
+    // The published artifact is CommonJS: the server that loads it constructs
+    // every class with `require()`, and an ES module is not constructible that
+    // way. `module: CommonJS` fixes the emit format here rather than reading
+    // it off the nearest package.json, which is what lets `src/` stay an ES
+    // module for the runtime that strips its types while `dist/` is required.
+    "module": "CommonJS",
+    "moduleResolution": "Node10",
     "lib": ["ES2022"],
     "outDir": "dist",
     "rootDir": "src",

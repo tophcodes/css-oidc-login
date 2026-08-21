@@ -1,0 +1,4 @@
+{
+  "//": "Not published: `files` ships dist/ only. Marks the suite as ES modules for the runtime that strips its types, the same way src/ is marked; see src/package.json.",
+  "type": "module"
+}

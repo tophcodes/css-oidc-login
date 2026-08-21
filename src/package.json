@@ -1,0 +1,4 @@
+{
+  "//": "Not published: `files` ships dist/ only. The package is CommonJS, but the suite runs these sources directly through the runtime that strips their types, and that runtime reads the module format off the nearest package.json. Without this marker every source here is read as CommonJS and its first `import` is a syntax error. The emit format is decided by tsconfig.json, not by this file.",
+  "type": "module"
+}

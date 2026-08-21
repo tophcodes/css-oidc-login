@@ -231,6 +231,8 @@ npm run build
 
 The build compiles `src/` with `tsc` and generates the component descriptions into `dist/components/`. The `@context` URL in the configuration must match the one that generation stamps into `dist/components/context.jsonld`; it tracks the package's major version, which is why a 0.x release is `^0.0.0`.
 
+**The build emits CommonJS**, and has to. Components.js constructs every class it is given with `require()`, so an ES module build gets discovered, registered and parsed exactly as a working one does, and then dies at the moment the first class is constructed. The sources are written as ES modules and the suite runs them that way; only what is published is CommonJS.
+
 Components.js discovers the package by scanning `node_modules` from the module path the server was started with, so nothing needs registering by hand once it is installed there.
 
 **In a container**, that scan is the whole story. The published server image holds the server and its own dependencies and nothing else, so a third-party handler means an image built on top of it: install this package where Components.js will find it, and add the configuration file and the two templates. No Dockerfile or tested recipe ships here and the author has not run it in a container — deploying that way means working the layout out from scratch and confirming afterwards that the new entry appears in the login-method list.
