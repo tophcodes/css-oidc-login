@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>css-oidc-login vocabulary</title>
+<link rel="alternate" type="text/turtle" href="ns.ttl">
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 46rem; margin: 3rem auto; padding: 0 1rem; line-height: 1.6; color: #222; }
+  code { background: #f4f4f4; padding: 0.1em 0.3em; border-radius: 3px; font-size: 0.95em; }
+  pre { background: #f4f4f4; padding: 1rem; border-radius: 4px; overflow-x: auto; }
+  h2 { margin-top: 2.5rem; font-size: 1.15rem; }
+  dt { font-weight: 600; margin-top: 1rem; }
+  dd { margin: 0.3rem 0 0 1.5rem; }
+  .iri { color: #555; font-size: 0.9em; word-break: break-all; }
+</style>
+</head>
+<body>
+
+<h1>css-oidc-login vocabulary</h1>
+
+<p>Three terms used by
+<a href="https://github.com/tophcodes/css-oidc-login">css-oidc-login</a>, a login
+method for the Community Solid Server that authenticates people against an
+external OpenID Connect provider.</p>
+
+<p>A WebID profile uses them to state that its owner accepts being authenticated
+by one particular subject at one particular provider. Both halves sit in a
+single grant node: an issuer alone grants nothing, and neither does a subject.
+Removing the node revokes external login for that person and nobody else.</p>
+
+<pre>&lt;https://pod.example.com/alice/profile/card#me&gt;
+  &lt;https://tophcodes.github.io/css-oidc-login/ns#externalLogin&gt; [
+    &lt;https://tophcodes.github.io/css-oidc-login/ns#issuer&gt;  &lt;https://id.example.com&gt; ;
+    &lt;https://tophcodes.github.io/css-oidc-login/ns#subject&gt; "b1e5c0de-4f2a-4c1e-9a77-1f0e2d3c4b5a"
+  ] .</pre>
+
+<h2>Terms</h2>
+
+<dl>
+  <dt id="externalLogin">externalLogin</dt>
+  <dd class="iri">https://tophcodes.github.io/css-oidc-login/ns#externalLogin</dd>
+  <dd>Relates a WebID to a grant node. The subject is the person's own WebID;
+  the object is a node carrying exactly one issuer and one subject identifier.
+  A profile may carry several, one per provider.</dd>
+
+  <dt id="issuer">issuer</dt>
+  <dd class="iri">https://tophcodes.github.io/css-oidc-login/ns#issuer</dd>
+  <dd>The issuer identifier of the OpenID Connect provider the grant applies to,
+  as an IRI. Compared against the <code>iss</code> claim of the ID token,
+  ignoring a trailing slash. A literal here does not count.</dd>
+
+  <dt id="subject">subject</dt>
+  <dd class="iri">https://tophcodes.github.io/css-oidc-login/ns#subject</dd>
+  <dd>The subject identifier that provider assigns to this person, as a literal.
+  Compared exactly against the <code>sub</code> claim. This is what makes the
+  grant name a person rather than a provider: without it, anyone able to obtain
+  a token from the same issuer would inherit the grant.</dd>
+</dl>
+
+<h2>Notes</h2>
+
+<p>These IRIs are identifiers. The server compares them as strings and never
+dereferences them, so this page is documentation rather than something the
+software fetches. A deployment preferring its own vocabulary can configure a
+different predicate for the first term; the two inside the grant node are fixed.</p>
+
+<p>The grant must be in the profile's default graph, with the person's own WebID
+as subject. A statement about somebody else, one parked in a named graph, or an
+issuer written as a quoted string are each refused — they place the issuer's
+name near the WebID without asserting anything about it.</p>
+
+<p>Also available as <a href="ns.ttl">Turtle</a>.</p>
+
+</body>
+</html>
