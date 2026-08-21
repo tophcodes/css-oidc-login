@@ -135,6 +135,22 @@ The `Set-Cookie` value is serialised by this package and handed to the server's 
 
 The store's `cookieName` decides both what is written and what has to be mapped, so a deployment can rename the cookie in one place. The store applies the `__Host-` prefix itself, so a configured `pod-pending-login` produces `__Host-pod-pending-login`, and that prefixed form is what the cookie-parser entry has to name.
 
+## The login-method list
+
+The entry reusing `urn:solid-server:default:LoginHandler` is what makes the method discoverable. It surfaces under `logins` in the response of `GET /.account/login/`, beside the server's own entry, and that object is the list the stock login page renders:
+
+```json
+{
+  "logins": {
+    "External OpenID Connect provider": "https://pod.example.com/.account/login/oidc/",
+    "Email/password combination": "https://pod.example.com/.account/login/password/"
+  },
+  "controls": { "password": "…", "main": "…", "html": "…" }
+}
+```
+
+`controls` in the same response is a different index: it holds the endpoint groups a login method registers in addition to its `LoginHandler` entry, which the password method does and this package does not. `controls` therefore reads the same before and after the method is added, and an unchanged `controls` is not evidence the entry was ignored — `logins` is where the method appears.
+
 ## Settings
 
 **`PendingLoginStore`** holds the logins in progress — for each, the PKCE code verifier and the opaque handle belonging to the browser that started it, keyed by the state sent to the provider — and owns the cookie's name and serialisation and the three metadata predicates above. Both handlers must be given the *same* instance; separate ones mean the callback never finds the login that started. `ttlMs` is how long a person may take between arriving at the provider and coming back, and is also the cookie's lifetime: ten minutes by default, generous for a passkey and tight enough that an abandoned attempt is not redeemable all day. `maxPending` is the most logins in progress at once, ten thousand by default; past it a login is refused with a 503 rather than an existing one being evicted.
